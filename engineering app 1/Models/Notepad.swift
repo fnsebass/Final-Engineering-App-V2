@@ -29,15 +29,22 @@ final class Notepad {
 
     // MARK: - Appearance settings (per notepad)
 
-    /// Spacing between grid lines, in points.
-    var gridSpacing: Double = 32
+    /// Background paper style, stored as a raw string. Access via `paperStyle`.
+    var paperStyleRaw: String = PaperStyle.grid.rawValue
 
-    /// Whether to draw the background grid.
-    var showsGrid: Bool = true
+    /// Number of grid boxes (columns) across the page width. Higher = smaller
+    /// boxes. Spacing is derived from the canvas width at draw time.
+    var gridColumns: Int = 16
 
     /// Paper (background) color as a "#RRGGBB" hex string. The pen color is
     /// always the opposite of this, so the ink is legible on any paper.
     var paperColorHex: String = "#FFFFFF"
+
+    /// Convenience wrapper over the raw paper-style string.
+    var paperStyle: PaperStyle {
+        get { PaperStyle(rawValue: paperStyleRaw) ?? .blank }
+        set { paperStyleRaw = newValue.rawValue }
+    }
 
     /// The folder this notepad belongs to, or nil if it's loose in the sidebar.
     var folder: Folder?

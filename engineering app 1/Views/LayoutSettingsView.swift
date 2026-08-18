@@ -13,6 +13,7 @@ enum LayoutPrefs {
     static let showDates = "layout.showDates"
     static let foldersFirst = "layout.foldersFirst"
     static let accentRaw = "layout.accent"
+    static let defaultPaperStyle = "layout.defaultPaperStyle"
 }
 
 enum LayoutAccent: String, CaseIterable, Identifiable {
@@ -32,10 +33,18 @@ enum LayoutAccent: String, CaseIterable, Identifiable {
 struct LayoutSettingsView: View {
     @AppStorage(LayoutPrefs.showDates) private var showDates = true
     @AppStorage(LayoutPrefs.accentRaw) private var accentRaw = LayoutAccent.blue.rawValue
+    @AppStorage(LayoutPrefs.defaultPaperStyle) private var defaultPaperStyleRaw = PaperStyle.grid.rawValue
 
     var body: some View {
         NavigationStack {
             Form {
+                Section("New notepad default") {
+                    Picker("Default paper style", selection: $defaultPaperStyleRaw) {
+                        ForEach(PaperStyle.allCases) { style in
+                            Label(style.displayName, systemImage: style.systemImage).tag(style.rawValue)
+                        }
+                    }
+                }
                 Section("Notepad cards") {
                     Toggle("Show edited dates", isOn: $showDates)
                 }

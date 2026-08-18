@@ -13,6 +13,7 @@ struct TopToolbar: View {
     @Binding var isEraser: Bool
     @Binding var penColor: Color
     @Binding var penWidth: Double
+    @Binding var pencilOnly: Bool
 
     /// The auto-contrast pen color (opposite of the paper) plus a few accents.
     let palette: [Color]
@@ -21,6 +22,13 @@ struct TopToolbar: View {
         HStack(spacing: 14) {
             toolButton(system: "pencil.tip", isSelected: !isEraser) { isEraser = false }
             toolButton(system: "eraser", isSelected: isEraser) { isEraser = true }
+
+            Divider().frame(height: 22)
+
+            // Pencil-only toggle: when on, only an Apple Pencil can draw.
+            toolButton(system: pencilOnly ? "applepencil" : "hand.point.up.left",
+                       isSelected: pencilOnly) { pencilOnly.toggle() }
+                .accessibilityLabel(pencilOnly ? "Pencil only (on)" : "Pencil only (off)")
 
             Divider().frame(height: 22)
 

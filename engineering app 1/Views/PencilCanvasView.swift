@@ -2,14 +2,16 @@
 //  PencilCanvasView.swift
 //  Tolerance
 //
-//  The infinite, grid-lined PencilKit canvas.
+//  The infinite PencilKit canvas with a background paper grid.
 //
-//  Input policy: finger/mouse can draw by default. As soon as an Apple Pencil
-//  is used, the canvas switches to Pencil-only (so a resting hand/finger won't
-//  mark the page). If no Pencil is ever used, any input keeps working.
+//  Layout: a container holds a grid view and, on top of it, a TRANSPARENT
+//  PKCanvasView. The grid is a viewport-sized backdrop that shifts with the
+//  canvas's scroll offset, so it appears continuous/infinite and always sits
+//  behind the ink. The grid is never part of the PKDrawing, so it is never
+//  saved, exported, or seen by the circle-gesture detector.
 //
-//  Grid: drawn by a background subview owned by a PKCanvasView subclass, laid
-//  out to cover the whole scrollable content and always kept behind the ink.
+//  Input policy: `pencilOnly` off (default) → any input draws (finger, mouse,
+//  Pencil). On → only an Apple Pencil draws.
 //
 //  iOS/iPadOS only.
 //
@@ -30,17 +32,15 @@ struct InkSelection: Identifiable {
 struct PencilCanvasView: UIViewRepresentable {
     let page: Page
 
-    // Appearance (from the notepad settings).
     let paperColorHex: String
-    let gridSpacing: Double
-    let showsGrid: Bool
+    let paperStyle: PaperStyle
+    let gridColumns: Int
 
-    // Tool state, driven by the top toolbar.
     @Binding var isEraser: Bool
     @Binding var penColor: Color
     @Binding var penWidth: Double
+    @Binding var pencilOnly: Bool
 
-    // Callbacks.
     var onCircleDetected: (InkSelection) -> Void = { _ in }
     var onLongPressProblem: (InkSelection) -> Void = { _ in }
     var onWritingChanged: (Bool) -> Void = { _ in }
@@ -48,65 +48,62 @@ struct PencilCanvasView: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
-    func makeUIView(context: Context) -> GriddedCanvasView {
-        let canvas = GriddedCanvasView()
+    func makeUIView(context: Context) -> CanvasContainerView {
+        let container = CanvasContainerView()
+        let canvas = container.canvas
         canvas.delegate = context.coordinator
-        // Start permissive so finger/mouse works; the Pencil detector below
-        // flips this to Pencil-only the first time a Pencil is used.
-        canvas.drawingPolicy = .anyInput
+        canvas.drawingPolicy = pencilOnly ? .pencilOnly : .anyInput
         canvas.alwaysBounceVertical = true
-        canvas.showsVerticalScrollIndicator = true
 
         if let drawing = try? PKDrawing(data: page.drawingData) {
             canvas.drawing = drawing
         }
-        context.coordinator.canvas = canvas
+        context.coordinator.container = container
 
-        // Long-press (finger) selects a problem for the pill menu.
         let longPress = UILongPressGestureRecognizer(
             target: context.coordinator,
             action: #selector(Coordinator.handleLongPress(_:)))
         longPress.minimumPressDuration = 0.4
         canvas.addGestureRecognizer(longPress)
 
-        // Detects Apple Pencil touches (without consuming them) to switch modes.
-        let pencilDetector = PencilDetectorGesture()
-        pencilDetector.onPencil = { [weak canvas] in
-            if canvas?.drawingPolicy != .pencilOnly { canvas?.drawingPolicy = .pencilOnly }
-        }
-        canvas.addGestureRecognizer(pencilDetector)
-
         context.coordinator.applyAppearance()
         context.coordinator.applyTool()
         context.coordinator.growContentIfNeeded(minimumHeight: 2400)
-        return canvas
+        return container
     }
 
-    func updateUIView(_ canvas: GriddedCanvasView, context: Context) {
+    func updateUIView(_ container: CanvasContainerView, context: Context) {
         context.coordinator.parent = self
+        let desiredPolicy: PKCanvasViewDrawingPolicy = pencilOnly ? .pencilOnly : .anyInput
+        if container.canvas.drawingPolicy != desiredPolicy {
+            container.canvas.drawingPolicy = desiredPolicy
+        }
         context.coordinator.applyAppearance()
         context.coordinator.applyTool()
     }
 
     final class Coordinator: NSObject, PKCanvasViewDelegate {
         var parent: PencilCanvasView
-        weak var canvas: GriddedCanvasView?
+        weak var container: CanvasContainerView?
 
         private var hasLoaded = false
         private var isEditingProgrammatically = false
 
         init(_ parent: PencilCanvasView) { self.parent = parent }
 
+        private var canvas: PKCanvasView? { container?.canvas }
+
         // MARK: Appearance & tool
 
         func applyAppearance() {
-            guard let canvas else { return }
-            canvas.backgroundColor = PaperTheme.uiColor(fromHex: parent.paperColorHex)
-            canvas.grid.configure(
-                spacing: CGFloat(parent.gridSpacing),
-                paper: PaperTheme.uiColor(fromHex: parent.paperColorHex),
-                grid: PaperTheme.gridUIColor(forPaperHex: parent.paperColorHex),
-                shows: parent.showsGrid)
+            guard let container else { return }
+            let paper = PaperTheme.uiColor(fromHex: parent.paperColorHex)
+            container.backgroundColor = paper
+            container.canvas.backgroundColor = .clear
+            container.canvas.isOpaque = false
+            container.grid.configure(style: parent.paperStyle, columns: parent.gridColumns, paper: paper)
+            container.grid.scrollOffsetY = container.canvas.contentOffset.y
+            container.grid.setNeedsDisplay()
         }
 
         func applyTool() {
@@ -127,26 +124,22 @@ struct PencilCanvasView: UIViewRepresentable {
             let target = max(minimumHeight, neededForDrawing, canvas.contentSize.height)
             if abs(canvas.contentSize.width - width) > 0.5 || canvas.contentSize.height < target {
                 canvas.contentSize = CGSize(width: width, height: target)
-                canvas.setNeedsLayout()
             }
         }
 
         func scrollViewDidScroll(_ scrollView: UIScrollView) {
-            guard let canvas else { return }
-            if scrollView.contentOffset.y + scrollView.bounds.height > canvas.contentSize.height - 800 {
+            container?.grid.scrollOffsetY = scrollView.contentOffset.y
+            container?.grid.setNeedsDisplay()
+            if let canvas,
+               scrollView.contentOffset.y + scrollView.bounds.height > canvas.contentSize.height - 800 {
                 growContentIfNeeded(minimumHeight: canvas.contentSize.height + 1600)
             }
         }
 
         // MARK: Drawing
 
-        func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
-            parent.onWritingChanged(true)
-        }
-
-        func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
-            parent.onWritingChanged(false)
-        }
+        func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) { parent.onWritingChanged(true) }
+        func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) { parent.onWritingChanged(false) }
 
         func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
             guard hasLoaded else { hasLoaded = true; return }
@@ -216,8 +209,6 @@ struct PencilCanvasView: UIViewRepresentable {
                                                    croppedImage: image))
         }
 
-        // MARK: Saving
-
         private func save(_ drawing: PKDrawing) {
             parent.page.drawingData = drawing.dataRepresentation()
             parent.page.notepad?.markEdited()
@@ -225,17 +216,19 @@ struct PencilCanvasView: UIViewRepresentable {
     }
 }
 
-// MARK: - Gridded canvas subclass
+// MARK: - Container
 
-/// A PKCanvasView that owns a grid background and keeps it sized to the full
-/// scrollable content and behind the ink.
-final class GriddedCanvasView: PKCanvasView {
+/// Holds the grid backdrop and a transparent PKCanvasView on top of it.
+final class CanvasContainerView: UIView {
     let grid = GridBackgroundView()
+    let canvas = PKCanvasView()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         addSubview(grid)
-        sendSubviewToBack(grid)
+        addSubview(canvas)
+        canvas.backgroundColor = .clear
+        canvas.isOpaque = false
     }
 
     @available(*, unavailable)
@@ -243,64 +236,80 @@ final class GriddedCanvasView: PKCanvasView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        let width = bounds.width
-        let height = max(contentSize.height, bounds.height)
-        let size = CGSize(width: width, height: height)
-        if grid.frame.size != size {
-            grid.frame = CGRect(origin: .zero, size: size)
-        }
-        sendSubviewToBack(grid)
+        grid.frame = bounds
+        canvas.frame = bounds
     }
 }
 
-// MARK: - Grid background
+// MARK: - Paper background
 
-/// Draws the paper fill and grid lines.
+/// Draws the paper fill and the selected paper style (grid / dots / lined) as a
+/// viewport-sized backdrop that shifts with the canvas scroll offset. The
+/// line/dot color is a de-emphasized light gray.
 final class GridBackgroundView: UIView {
-    private var spacing: CGFloat = 32
-    private var gridColor: UIColor = .gray
-    private var shows = true
+    private var style: PaperStyle = .blank
+    private var columns: Int = 16
+    var scrollOffsetY: CGFloat = 0
 
-    func configure(spacing: CGFloat, paper: UIColor, grid: UIColor, shows: Bool) {
-        self.spacing = max(spacing, 8)
-        self.gridColor = grid
-        self.shows = shows
+    private let lineColor = UIColor(red: 0xD0 / 255.0, green: 0xD0 / 255.0, blue: 0xD0 / 255.0, alpha: 1.0)
+
+    func configure(style: PaperStyle, columns: Int, paper: UIColor) {
+        self.style = style
+        self.columns = max(columns, 2)
         backgroundColor = paper
         isUserInteractionEnabled = false
         setNeedsDisplay()
     }
 
     override func draw(_ rect: CGRect) {
-        guard shows, let context = UIGraphicsGetCurrentContext() else { return }
-        context.setStrokeColor(gridColor.cgColor)
-        context.setLineWidth(max(1.0 / (window?.screen.scale ?? 2), 0.5))
+        guard style != .blank, bounds.width > 0, let context = UIGraphicsGetCurrentContext() else { return }
 
-        var x: CGFloat = 0
-        while x <= bounds.width {
-            context.move(to: CGPoint(x: x, y: 0))
-            context.addLine(to: CGPoint(x: x, y: bounds.height))
-            x += spacing
+        let spacing = bounds.width / CGFloat(columns)
+        guard spacing >= 3 else { return }
+
+        // Vertical alignment shifts with scroll so the grid looks continuous.
+        let phase = scrollOffsetY.truncatingRemainder(dividingBy: spacing)
+        let firstY = -phase
+
+        switch style {
+        case .blank:
+            break
+
+        case .grid:
+            context.setStrokeColor(lineColor.cgColor)
+            context.setLineWidth(0.5) // hairline
+            var x: CGFloat = 0
+            while x <= bounds.width + 0.5 {
+                context.move(to: CGPoint(x: x, y: 0)); context.addLine(to: CGPoint(x: x, y: bounds.height)); x += spacing
+            }
+            var y = firstY
+            while y <= bounds.height + 0.5 {
+                context.move(to: CGPoint(x: 0, y: y)); context.addLine(to: CGPoint(x: bounds.width, y: y)); y += spacing
+            }
+            context.strokePath()
+
+        case .dots:
+            context.setFillColor(lineColor.cgColor)
+            let diameter: CGFloat = 1.8
+            var y = firstY
+            while y <= bounds.height + spacing {
+                var x: CGFloat = 0
+                while x <= bounds.width + 0.5 {
+                    context.fillEllipse(in: CGRect(x: x - diameter / 2, y: y - diameter / 2, width: diameter, height: diameter))
+                    x += spacing
+                }
+                y += spacing
+            }
+
+        case .lined:
+            context.setStrokeColor(lineColor.cgColor)
+            context.setLineWidth(0.5)
+            var y = firstY
+            while y <= bounds.height + 0.5 {
+                context.move(to: CGPoint(x: 0, y: y)); context.addLine(to: CGPoint(x: bounds.width, y: y)); y += spacing
+            }
+            context.strokePath()
         }
-        var y: CGFloat = 0
-        while y <= bounds.height {
-            context.move(to: CGPoint(x: 0, y: y))
-            context.addLine(to: CGPoint(x: bounds.width, y: y))
-            y += spacing
-        }
-        context.strokePath()
-    }
-}
-
-// MARK: - Pencil detection
-
-/// A do-nothing gesture recognizer that reports when an Apple Pencil touch is
-/// seen, then fails immediately so it never interferes with drawing/scrolling.
-final class PencilDetectorGesture: UIGestureRecognizer {
-    var onPencil: () -> Void = {}
-
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
-        if touches.contains(where: { $0.type == .pencil }) { onPencil() }
-        state = .failed
     }
 }
 

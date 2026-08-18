@@ -23,6 +23,7 @@ struct CanvasWorkspace: View {
     @State private var isEraser = false
     @State private var penColor: Color = .black
     @State private var penWidth: Double = 3
+    @State private var pencilOnly = false
     @State private var toolbarVisible = true
 
     // Gesture selections.
@@ -83,11 +84,12 @@ struct CanvasWorkspace: View {
                 PencilCanvasView(
                     page: page,
                     paperColorHex: notepad.paperColorHex,
-                    gridSpacing: notepad.gridSpacing,
-                    showsGrid: notepad.showsGrid,
+                    paperStyle: notepad.paperStyle,
+                    gridColumns: notepad.gridColumns,
                     isEraser: $isEraser,
                     penColor: $penColor,
                     penWidth: $penWidth,
+                    pencilOnly: $pencilOnly,
                     onCircleDetected: { circleSelection = $0; problemSelection = nil },
                     onLongPressProblem: { problemSelection = $0; circleSelection = nil },
                     onWritingChanged: { writing in
@@ -100,7 +102,8 @@ struct CanvasWorkspace: View {
                 .ignoresSafeArea(.container, edges: .bottom)
 
                 if toolbarVisible {
-                    TopToolbar(isEraser: $isEraser, penColor: $penColor, penWidth: $penWidth, palette: palette)
+                    TopToolbar(isEraser: $isEraser, penColor: $penColor, penWidth: $penWidth,
+                               pencilOnly: $pencilOnly, palette: palette)
                         .padding(.top, 8)
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }

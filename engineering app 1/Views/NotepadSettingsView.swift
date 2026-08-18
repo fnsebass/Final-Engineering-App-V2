@@ -2,9 +2,10 @@
 //  NotepadSettingsView.swift
 //  Tolerance
 //
-//  The settings menu (opened from the gear at the top-left inside a notepad).
-//  Controls the grid scale, whether the grid shows, and the paper color. The
-//  pen color always follows automatically as the opposite of the paper.
+//  The paper-style / settings menu opened from the gear (top-right) inside a
+//  notepad. Controls the background paper style, its spacing, and the paper
+//  color. The pen color always follows automatically as the opposite of the
+//  paper. All settings persist with the notepad.
 //
 
 #if os(iOS)
@@ -22,6 +23,32 @@ struct NotepadSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("Paper style") {
+                    Picker("Style", selection: $notepad.paperStyleRaw) {
+                        ForEach(PaperStyle.allCases) { style in
+                            Label(style.displayName, systemImage: style.systemImage).tag(style.rawValue)
+                        }
+                    }
+                    .pickerStyle(.inline)
+                    .labelsHidden()
+                }
+
+                if notepad.paperStyle != .blank {
+                    Section("Grid size") {
+                        Slider(
+                            value: Binding(
+                                get: { Double(notepad.gridColumns) },
+                                set: { notepad.gridColumns = Int($0.rounded()) }
+                            ),
+                            in: 6...40, step: 1
+                        )
+                        Text("\(notepad.gridColumns) boxes per row")
+                            .font(.subheadline)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 Section("Paper color") {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 44), spacing: 12)], spacing: 12) {
                         ForEach(PaperTheme.presets, id: \.hex) { preset in
@@ -32,29 +59,17 @@ struct NotepadSettingsView: View {
                     ColorPicker("Custom paper color", selection: paperColorBinding, supportsOpacity: false)
                 }
 
-                Section("Grid") {
-                    Toggle("Show grid", isOn: $notepad.showsGrid)
-                    HStack {
-                        Text("Grid size")
-                        Slider(value: $notepad.gridSpacing, in: 12...72, step: 2)
-                        Text("\(Int(notepad.gridSpacing))")
-                            .monospacedDigit()
-                            .foregroundStyle(.secondary)
-                    }
-                    .disabled(!notepad.showsGrid)
-                }
-
                 Section {
-                    Label("The pen color is always set to the opposite of the paper, so your ink stays legible.",
+                    Label("The pen color is always the opposite of the paper, so ink stays legible.",
                           systemImage: "pencil.tip")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
             }
-            .navigationTitle("Notepad Settings")
+            .navigationTitle("Paper & Settings")
             .navigationBarTitleDisplayMode(.inline)
         }
-        .frame(minWidth: 340, minHeight: 420)
+        .frame(minWidth: 360, minHeight: 460)
     }
 
     private func presetSwatch(_ hex: String) -> some View {

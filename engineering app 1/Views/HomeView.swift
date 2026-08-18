@@ -54,6 +54,7 @@ struct HomeView: View {
 
     @AppStorage(LayoutPrefs.showDates) private var showDates = true
     @AppStorage(LayoutPrefs.accentRaw) private var accentRaw = LayoutAccent.blue.rawValue
+    @AppStorage(LayoutPrefs.defaultPaperStyle) private var defaultPaperStyleRaw = PaperStyle.grid.rawValue
 
     private var accent: Color { LayoutAccent(rawValue: accentRaw)?.color ?? .blue }
 
@@ -188,6 +189,7 @@ struct HomeView: View {
 
     private func createNotepad() {
         let notepad = Notepad()
+        notepad.paperStyleRaw = defaultPaperStyleRaw // personal default paper style
         notepad.folder = selectedFolder // create inside the current folder, if any
         modelContext.insert(notepad)
         let firstPage = Page(pageIndex: 0)
