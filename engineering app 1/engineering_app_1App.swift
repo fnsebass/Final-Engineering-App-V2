@@ -1,18 +1,20 @@
 //
 //  engineering_app_1App.swift
-//  engineering app 1
+//  Tolerance
 //
-//  Created by Sebastián buso on 7/30/26.
+//  App entry point. Sets up the SwiftData model container for local, on-device
+//  persistence (no cloud sync in v1).
 //
 
 import SwiftUI
 import SwiftData
 
 @main
-struct engineering_app_1App: App {
+struct ToleranceApp: App {
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
-            Item.self,
+            Notepad.self,
+            Page.self,
         ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
@@ -25,7 +27,7 @@ struct engineering_app_1App: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            HomeView()
         }
         .modelContainer(sharedModelContainer)
     }
