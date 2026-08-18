@@ -2,10 +2,11 @@
 //  HomeView.swift
 //  Tolerance
 //
-//  Home screen. A sidebar sorts notepads, groups them into folders (drag a
-//  notepad onto a folder to file it), and hosts New Notepad / New Folder
-//  buttons plus a "Customize Layout" settings box pinned to the bottom.
-//  Selecting or creating a notepad opens it in the larger detail panel.
+//  Home screen. The sidebar holds folders (plus "All Notepads") and the
+//  New Notepad / New Folder buttons and a bottom "Customize Layout" box. The
+//  larger detail panel shows a grid of the selected container's notepads:
+//  "All Notepads" shows loose notepads; a folder shows only its own. Opening a
+//  notepad replaces the grid with the editor.
 //
 
 import SwiftUI
@@ -20,6 +21,12 @@ struct NotepadDrag: Transferable, Codable {
     }
 }
 
+/// What the sidebar has selected, which drives the detail grid.
+enum SidebarSelection: Hashable {
+    case loose
+    case folder(PersistentIdentifier)
+}
+
 enum NotepadSort: String, CaseIterable, Identifiable {
     case lastEdited = "Last edited"
     case created = "Date created"
@@ -32,11 +39,11 @@ struct HomeView: View {
     @Query private var notepads: [Notepad]
     @Query private var folders: [Folder]
 
-    @State private var selection: Notepad?
+    @State private var selection: SidebarSelection? = .loose
+    @State private var openNotepad: Notepad?
     @State private var sort: NotepadSort = .lastEdited
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
-    // Sheets / alerts.
     @State private var showLayoutSettings = false
     @State private var showNewFolderAlert = false
     @State private var newFolderName = ""
@@ -45,32 +52,29 @@ struct HomeView: View {
     @State private var folderRenameTarget: Folder?
     @State private var folderRenameText = ""
 
-    // Layout prefs.
     @AppStorage(LayoutPrefs.showDates) private var showDates = true
-    @AppStorage(LayoutPrefs.foldersFirst) private var foldersFirst = true
     @AppStorage(LayoutPrefs.accentRaw) private var accentRaw = LayoutAccent.blue.rawValue
 
-    private var accent: Color {
-        LayoutAccent(rawValue: accentRaw)?.color ?? .blue
+    private var accent: Color { LayoutAccent(rawValue: accentRaw)?.color ?? .blue }
+
+    private var selectedFolder: Folder? {
+        if case let .folder(id) = selection { return modelContext.model(for: id) as? Folder }
+        return nil
+    }
+
+    private var containerNotepads: [Notepad] {
+        let list = selectedFolder?.notepads ?? notepads.filter { $0.folder == nil }
+        return sorted(list)
     }
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebar
         } detail: {
-            if let selection {
-                NotepadEditorView(notepad: selection, onBack: goBack)
-                    .id(selection.persistentModelID)
-            } else {
-                ContentUnavailableView("Select a Notepad",
-                                       systemImage: "sidebar.left",
-                                       description: Text("Choose a notepad on the left, or create a new one."))
-            }
+            detail
         }
         .tint(accent)
-        .onChange(of: selection) { _, newValue in
-            if newValue != nil { withAnimation { columnVisibility = .detailOnly } }
-        }
+        .onChange(of: selection) { _, _ in openNotepad = nil }
         .alert("New Folder", isPresented: $showNewFolderAlert) {
             TextField("Folder name", text: $newFolderName)
             Button("Cancel", role: .cancel) { newFolderName = "" }
@@ -85,6 +89,28 @@ struct HomeView: View {
             TextField("Name", text: $folderRenameText)
             Button("Cancel", role: .cancel) { folderRenameTarget = nil }
             Button("Save") { commitFolderRename() }
+        }
+    }
+
+    // MARK: - Detail
+
+    @ViewBuilder
+    private var detail: some View {
+        if let openNotepad {
+            NotepadEditorView(notepad: openNotepad, onBack: closeNotepad)
+                .id(openNotepad.persistentModelID)
+        } else {
+            NotepadGridView(
+                title: selectedFolder?.name ?? "All Notepads",
+                notepads: containerNotepads,
+                showDates: showDates,
+                isInFolder: selectedFolder != nil,
+                onOpen: open,
+                onNew: createNotepad,
+                onRename: beginRename,
+                onDelete: delete,
+                onRemoveFromFolder: { $0.folder = nil }
+            )
         }
     }
 
@@ -111,72 +137,33 @@ struct HomeView: View {
                 .labelsHidden()
             }
 
-            if foldersFirst {
-                foldersSection
-                looseSection
-            } else {
-                looseSection
-                foldersSection
+            Section("Library") {
+                Label("All Notepads", systemImage: "tray.full")
+                    .tag(SidebarSelection.loose)
+                    .dropDestination(for: NotepadDrag.self) { items, _ in
+                        setFolder(nil, for: items); return true
+                    }
+
+                ForEach(folders.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }) { folder in
+                    Label("\(folder.name)  (\(folder.notepads.count))", systemImage: "folder")
+                        .tag(SidebarSelection.folder(folder.persistentModelID))
+                        .dropDestination(for: NotepadDrag.self) { items, _ in
+                            setFolder(folder, for: items); return true
+                        }
+                        .contextMenu {
+                            Button { beginFolderRename(folder) } label: { Label("Rename", systemImage: "pencil") }
+                            Button(role: .destructive) { deleteFolder(folder) } label: { Label("Delete Folder", systemImage: "trash") }
+                        }
+                }
+                if folders.isEmpty {
+                    Text("No folders yet — tap New Folder, then drag notepads onto it.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
         }
         .navigationTitle("Tolerance")
         .safeAreaInset(edge: .bottom) { bottomBar }
         .sheet(isPresented: $showLayoutSettings) { LayoutSettingsView() }
-    }
-
-    private var foldersSection: some View {
-        Section("Folders") {
-            if folders.isEmpty {
-                Text("No folders yet — tap New Folder, then drag notepads in.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            ForEach(folders.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }) { folder in
-                DisclosureGroup {
-                    ForEach(sorted(folder.notepads)) { notepad in
-                        notepadRow(notepad)
-                    }
-                } label: {
-                    Label("\(folder.name)  (\(folder.notepads.count))", systemImage: "folder")
-                        .contextMenu {
-                            Button { beginFolderRename(folder) } label: { Label("Rename", systemImage: "pencil") }
-                            Button(role: .destructive) { modelContext.delete(folder) } label: { Label("Delete Folder", systemImage: "trash") }
-                        }
-                        .dropDestination(for: NotepadDrag.self) { items, _ in
-                            fileNotepads(items, into: folder)
-                            return true
-                        }
-                }
-            }
-        }
-    }
-
-    private var looseSection: some View {
-        Section("Notepads") {
-            let loose = sorted(notepads.filter { $0.folder == nil })
-            if loose.isEmpty {
-                Text("No loose notepads.").font(.caption).foregroundStyle(.secondary)
-            }
-            ForEach(loose) { notepad in
-                notepadRow(notepad)
-            }
-        }
-    }
-
-    private func notepadRow(_ notepad: Notepad) -> some View {
-        NavigationLink(value: notepad) {
-            NotepadRow(notepad: notepad, showDate: showDates)
-        }
-        .draggable(NotepadDrag(id: notepad.persistentModelID))
-        .contextMenu {
-            Button { beginRename(notepad) } label: { Label("Rename", systemImage: "pencil") }
-            if notepad.folder != nil {
-                Button { notepad.folder = nil } label: { Label("Remove from Folder", systemImage: "folder.badge.minus") }
-            }
-            Button(role: .destructive) { delete(notepad) } label: { Label("Delete", systemImage: "trash") }
-        }
-        .swipeActions {
-            Button(role: .destructive) { delete(notepad) } label: { Label("Delete", systemImage: "trash") }
-        }
     }
 
     private var bottomBar: some View {
@@ -201,21 +188,21 @@ struct HomeView: View {
 
     private func createNotepad() {
         let notepad = Notepad()
+        notepad.folder = selectedFolder // create inside the current folder, if any
         modelContext.insert(notepad)
         let firstPage = Page(pageIndex: 0)
         firstPage.notepad = notepad
         modelContext.insert(firstPage)
-        selection = notepad // opens in the middle detail panel
+        open(notepad)
     }
 
     private func createFolder() {
         let trimmed = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let folder = Folder(name: trimmed.isEmpty ? "New Folder" : trimmed)
-        modelContext.insert(folder)
+        modelContext.insert(Folder(name: trimmed.isEmpty ? "New Folder" : trimmed))
         newFolderName = ""
     }
 
-    private func fileNotepads(_ items: [NotepadDrag], into folder: Folder) {
+    private func setFolder(_ folder: Folder?, for items: [NotepadDrag]) {
         for item in items {
             if let notepad = modelContext.model(for: item.id) as? Notepad {
                 notepad.folder = folder
@@ -223,14 +210,24 @@ struct HomeView: View {
         }
     }
 
+    private func open(_ notepad: Notepad) {
+        openNotepad = notepad
+        withAnimation { columnVisibility = .detailOnly }
+    }
+
+    private func closeNotepad() {
+        openNotepad = nil
+        withAnimation { columnVisibility = .all }
+    }
+
     private func delete(_ notepad: Notepad) {
-        if selection == notepad { selection = nil }
+        if openNotepad == notepad { openNotepad = nil }
         modelContext.delete(notepad)
     }
 
-    private func goBack() {
-        selection = nil
-        withAnimation { columnVisibility = .all }
+    private func deleteFolder(_ folder: Folder) {
+        if case let .folder(id) = selection, id == folder.persistentModelID { selection = .loose }
+        modelContext.delete(folder) // notepads become loose (nullify)
     }
 
     private func beginRename(_ notepad: Notepad) { renameTarget = notepad; renameText = notepad.title }
@@ -257,18 +254,79 @@ struct HomeView: View {
     }
 }
 
-private struct NotepadRow: View {
+// MARK: - Grid
+
+private struct NotepadGridView: View {
+    let title: String
+    let notepads: [Notepad]
+    let showDates: Bool
+    let isInFolder: Bool
+    let onOpen: (Notepad) -> Void
+    let onNew: () -> Void
+    let onRename: (Notepad) -> Void
+    let onDelete: (Notepad) -> Void
+    let onRemoveFromFolder: (Notepad) -> Void
+
+    private let columns = [GridItem(.adaptive(minimum: 180, maximum: 240), spacing: 20)]
+
+    var body: some View {
+        Group {
+            if notepads.isEmpty {
+                ContentUnavailableView {
+                    Label("No Notepads", systemImage: "doc")
+                } description: {
+                    Text("Tap the + button to create one.")
+                }
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: columns, spacing: 20) {
+                        ForEach(notepads) { notepad in
+                            Button { onOpen(notepad) } label: { NotepadCard(notepad: notepad, showDate: showDates) }
+                                .buttonStyle(.plain)
+                                .draggable(NotepadDrag(id: notepad.persistentModelID))
+                                .contextMenu {
+                                    Button { onRename(notepad) } label: { Label("Rename", systemImage: "pencil") }
+                                    if isInFolder {
+                                        Button { onRemoveFromFolder(notepad) } label: { Label("Remove from Folder", systemImage: "folder.badge.minus") }
+                                    }
+                                    Button(role: .destructive) { onDelete(notepad) } label: { Label("Delete", systemImage: "trash") }
+                                }
+                        }
+                    }
+                    .padding()
+                }
+            }
+        }
+        .navigationTitle(title)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button(action: onNew) { Label("New Notepad", systemImage: "plus") }
+            }
+        }
+    }
+}
+
+private struct NotepadCard: View {
     let notepad: Notepad
     let showDate: Bool
+
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "doc.text").foregroundStyle(.tint)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(notepad.title).lineLimit(1)
-                if showDate {
-                    Text(notepad.lastEditedDate, format: .relative(presentation: .named))
-                        .font(.caption).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            RoundedRectangle(cornerRadius: 12)
+                .fill(.quaternary)
+                .frame(height: 150)
+                .overlay(Image(systemName: "doc.text").font(.system(size: 40)).foregroundStyle(.tint))
+                .overlay(alignment: .bottomTrailing) {
+                    Text("\(notepad.pages.count) pg")
+                        .font(.caption2)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(.thinMaterial, in: Capsule())
+                        .padding(8)
                 }
+            Text(notepad.title).font(.headline).lineLimit(1)
+            if showDate {
+                Text(notepad.lastEditedDate, format: .relative(presentation: .named))
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
     }

@@ -31,15 +31,13 @@ enum LayoutAccent: String, CaseIterable, Identifiable {
 
 struct LayoutSettingsView: View {
     @AppStorage(LayoutPrefs.showDates) private var showDates = true
-    @AppStorage(LayoutPrefs.foldersFirst) private var foldersFirst = true
     @AppStorage(LayoutPrefs.accentRaw) private var accentRaw = LayoutAccent.blue.rawValue
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Sidebar") {
+                Section("Notepad cards") {
                     Toggle("Show edited dates", isOn: $showDates)
-                    Toggle("List folders first", isOn: $foldersFirst)
                 }
                 Section("Accent color") {
                     Picker("Accent", selection: $accentRaw) {
