@@ -2,20 +2,24 @@
 //  AIResultPanel.swift
 //  Tolerance
 //
-//  Phase 6: the side panel that shows BOTH v1 checks for the circled content —
-//  the deterministic Unit Check and the on-device AI Review — clearly separated
-//  under their own headers.
+//  The side panel. It always shows the recognized equation (editable) and the
+//  deterministic Unit Check. The AI section depends on the mode:
+//    • .check   – per-step review: each step is underlined with a dotted line,
+//                 green if correct, red at the mistake.
+//    • .explain – a step-by-step walkthrough of how to solve the problem.
 //
-//  Plain SwiftUI (no platform-specific types) so it compiles everywhere.
+//  iOS/iPadOS only (uses PanelMode from the workspace).
 //
 
+#if os(iOS)
 import SwiftUI
 
 struct AIResultPanel: View {
-    /// The recognized equation, editable so users can correct OCR mistakes.
     @Binding var recognizedText: String
+    let mode: PanelMode
     let unitResult: UnitCheckResult?
-    let aiResult: AIReviewResult?
+    let stepReview: StepReviewResult?
+    let explanation: AIReviewResult?
     let isAnalyzing: Bool
     let onRerun: () -> Void
 
@@ -30,22 +34,22 @@ struct AIResultPanel: View {
             }
             .padding()
         }
-        .navigationTitle("AI Assistant")
+        .navigationTitle(mode == .explain ? "How to Solve" : "AI Assistant")
     }
 
     // MARK: Recognized equation
 
     private var recognizedSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionHeader(title: "Circled Equation", systemImage: "character.cursor.ibeam")
-            Text("Read from your handwriting — edit if it's wrong, then re-check.")
+            SectionHeader(title: "Selected Problem", systemImage: "character.cursor.ibeam")
+            Text("Read from your handwriting — edit if it's wrong, then re-run.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            TextField("Recognized equation", text: $recognizedText, axis: .vertical)
+            TextField("Recognized text", text: $recognizedText, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .font(.body.monospaced())
             Button(action: onRerun) {
-                Label("Re-check", systemImage: "arrow.clockwise")
+                Label("Re-run", systemImage: "arrow.clockwise")
             }
             .buttonStyle(.bordered)
             .disabled(isAnalyzing || recognizedText.trimmingCharacters(in: .whitespaces).isEmpty)
@@ -58,22 +62,17 @@ struct AIResultPanel: View {
         VStack(alignment: .leading, spacing: 8) {
             SectionHeader(title: "Unit Check", systemImage: "ruler")
             Text("Deterministic dimensional analysis — no AI.")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .font(.caption2).foregroundStyle(.tertiary)
 
             if isAnalyzing && unitResult == nil {
                 ProgressView().controlSize(.small)
             } else if let result = unitResult {
                 HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: unitIcon(result.status))
-                        .foregroundStyle(unitColor(result.status))
+                    Image(systemName: unitIcon(result.status)).foregroundStyle(unitColor(result.status))
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(result.headline)
-                            .font(.subheadline.weight(.medium))
+                        Text(result.headline).font(.subheadline.weight(.medium))
                         ForEach(result.details, id: \.self) { detail in
-                            Text(detail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Text(detail).font(.caption).foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -83,46 +82,93 @@ struct AIResultPanel: View {
         }
     }
 
-    // MARK: AI review
+    // MARK: AI section
 
+    @ViewBuilder
     private var aiSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            SectionHeader(title: "AI Review", systemImage: "sparkles")
+        VStack(alignment: .leading, spacing: 10) {
+            SectionHeader(title: mode == .explain ? "AI Walkthrough" : "AI Review",
+                          systemImage: "sparkles")
             Text(AIReviewResult.disclaimer)
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .font(.caption2).foregroundStyle(.tertiary)
 
-            if isAnalyzing && aiResult == nil {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("Thinking on-device…").font(.caption).foregroundStyle(.secondary)
-                }
-            } else if let result = aiResult {
-                switch result.state {
-                case .reviewed:
-                    Text(result.reviewText ?? "")
-                        .font(.subheadline)
-                        .textSelection(.enabled)
-                case .modelUnavailable(let reason):
-                    Label(reason, systemImage: "exclamationmark.icloud")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                case .skipped(let reason):
-                    Label(reason, systemImage: "questionmark.circle")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                case .failed(let reason):
-                    Label("AI review failed: \(reason)", systemImage: "xmark.octagon")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+            if mode == .check {
+                stepReviewContent
             } else {
-                Text("No result.").font(.caption).foregroundStyle(.secondary)
+                explanationContent
             }
         }
     }
 
-    // MARK: Styling helpers
+    @ViewBuilder
+    private var stepReviewContent: some View {
+        if isAnalyzing && stepReview == nil {
+            thinkingRow
+        } else if let review = stepReview {
+            switch review.state {
+            case .reviewed:
+                if let verdict = review.verdict, !verdict.isEmpty {
+                    Text(verdict).font(.subheadline.weight(.semibold))
+                }
+                Label("Green = correct step · Red = mistake", systemImage: "underline")
+                    .font(.caption2).foregroundStyle(.secondary)
+                ForEach(review.steps) { step in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(step.text)
+                            .font(.body.monospaced())
+                            .underline(true, pattern: .dot, color: step.isCorrect ? .green : .red)
+                        if !step.isCorrect && !step.note.isEmpty {
+                            Text(step.note).font(.caption).foregroundStyle(.red)
+                        }
+                    }
+                }
+                if review.steps.isEmpty {
+                    Text("The model didn't return any steps.").font(.caption).foregroundStyle(.secondary)
+                }
+            case .modelUnavailable(let reason):
+                unavailableRow(reason, system: "exclamationmark.icloud")
+            case .skipped(let reason):
+                unavailableRow(reason, system: "questionmark.circle")
+            case .failed(let reason):
+                unavailableRow("AI review failed: \(reason)", system: "xmark.octagon")
+            }
+        } else {
+            Text("No result.").font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var explanationContent: some View {
+        if isAnalyzing && explanation == nil {
+            thinkingRow
+        } else if let result = explanation {
+            switch result.state {
+            case .reviewed:
+                Text(result.reviewText ?? "").font(.subheadline).textSelection(.enabled)
+            case .modelUnavailable(let reason):
+                unavailableRow(reason, system: "exclamationmark.icloud")
+            case .skipped(let reason):
+                unavailableRow(reason, system: "questionmark.circle")
+            case .failed(let reason):
+                unavailableRow("AI failed: \(reason)", system: "xmark.octagon")
+            }
+        } else {
+            Text("No result.").font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private var thinkingRow: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text("Thinking on-device…").font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private func unavailableRow(_ text: String, system: String) -> some View {
+        Label(text, systemImage: system).font(.caption).foregroundStyle(.secondary)
+    }
+
+    // MARK: Styling
 
     private func unitIcon(_ status: UnitCheckResult.Status) -> String {
         switch status {
@@ -146,8 +192,6 @@ struct AIResultPanel: View {
 private struct SectionHeader: View {
     let title: String
     let systemImage: String
-    var body: some View {
-        Label(title, systemImage: systemImage)
-            .font(.headline)
-    }
+    var body: some View { Label(title, systemImage: systemImage).font(.headline) }
 }
+#endif

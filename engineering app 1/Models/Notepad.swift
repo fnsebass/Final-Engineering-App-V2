@@ -27,6 +27,18 @@ final class Notepad {
     @Relationship(deleteRule: .cascade, inverse: \Page.notepad)
     var pages: [Page]
 
+    // MARK: - Appearance settings (per notepad)
+
+    /// Spacing between grid lines, in points.
+    var gridSpacing: Double = 32
+
+    /// Whether to draw the background grid.
+    var showsGrid: Bool = true
+
+    /// Paper (background) color as a "#RRGGBB" hex string. The pen color is
+    /// always the opposite of this, so the ink is legible on any paper.
+    var paperColorHex: String = "#FFFFFF"
+
     init(title: String = "Untitled Notepad", createdDate: Date = .now) {
         self.title = title
         self.createdDate = createdDate
