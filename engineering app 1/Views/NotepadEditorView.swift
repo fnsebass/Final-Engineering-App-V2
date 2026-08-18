@@ -77,8 +77,7 @@ struct NotepadEditorView: View {
     @ViewBuilder
     private func pageCanvas(for page: Page) -> some View {
         #if os(iOS)
-        PencilCanvasView(page: page)
-            .ignoresSafeArea(.container, edges: .bottom)
+        CanvasWorkspace(page: page)
         #else
         ContentUnavailableView {
             Label("Use an iPad", systemImage: "ipad.and.arrow.forward")
