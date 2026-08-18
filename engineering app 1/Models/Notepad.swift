@@ -39,6 +39,9 @@ final class Notepad {
     /// always the opposite of this, so the ink is legible on any paper.
     var paperColorHex: String = "#FFFFFF"
 
+    /// The folder this notepad belongs to, or nil if it's loose in the sidebar.
+    var folder: Folder?
+
     init(title: String = "Untitled Notepad", createdDate: Date = .now) {
         self.title = title
         self.createdDate = createdDate

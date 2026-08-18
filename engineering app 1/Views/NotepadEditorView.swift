@@ -2,8 +2,8 @@
 //  NotepadEditorView.swift
 //  Tolerance
 //
-//  Hosts one notepad's infinite canvas, with a settings gear at the top-left
-//  for grid/paper options.
+//  Hosts one notepad's infinite canvas. Back button on the top-left returns to
+//  the home sidebar; the settings gear (grid/paper) is on the top-right.
 //
 
 import SwiftUI
@@ -11,6 +11,9 @@ import SwiftData
 
 struct NotepadEditorView: View {
     @Bindable var notepad: Notepad
+    /// Called when the user taps the back button.
+    var onBack: () -> Void = {}
+
     @State private var showSettings = false
 
     var body: some View {
@@ -20,6 +23,11 @@ struct NotepadEditorView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
+                    Button(action: onBack) {
+                        Label("Notepads", systemImage: "chevron.left")
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showSettings = true
                     } label: {

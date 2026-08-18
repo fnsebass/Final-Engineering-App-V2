@@ -56,9 +56,10 @@ enum PaperTheme {
 
     static func inkColor(forPaperHex hex: String) -> Color { Color(uiColor: inkUIColor(forPaperHex: hex)) }
 
-    /// A faint version of the ink color for grid lines.
+    /// Grid lines use the opposite color of the paper (same hue as the pen),
+    /// kept slightly translucent so ink still stands out on top.
     static func gridUIColor(forPaperHex hex: String) -> UIColor {
-        inkUIColor(forPaperHex: hex).withAlphaComponent(0.16)
+        inkUIColor(forPaperHex: hex).withAlphaComponent(0.35)
     }
 }
 #endif

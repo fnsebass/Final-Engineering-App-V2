@@ -15,6 +15,7 @@ struct ToleranceApp: App {
         let schema = Schema([
             Notepad.self,
             Page.self,
+            Folder.self,
         ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
