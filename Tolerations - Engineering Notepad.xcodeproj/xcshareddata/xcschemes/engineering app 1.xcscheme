@@ -18,7 +18,7 @@
                BlueprintIdentifier = "B738F334301C1874000F34C4"
                BuildableName = "engineering app 1.app"
                BlueprintName = "engineering app 1"
-               ReferencedContainer = "container:engineering app 1.xcodeproj">
+               ReferencedContainer = "container:Tolerations - Engineering Notepad.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -38,7 +38,7 @@
                BlueprintIdentifier = "B738F343301C1876000F34C4"
                BuildableName = "engineering app 1Tests.xctest"
                BlueprintName = "engineering app 1Tests"
-               ReferencedContainer = "container:engineering app 1.xcodeproj">
+               ReferencedContainer = "container:Tolerations - Engineering Notepad.xcodeproj">
             </BuildableReference>
          </TestableReference>
          <TestableReference
@@ -49,7 +49,7 @@
                BlueprintIdentifier = "B738F34D301C1876000F34C4"
                BuildableName = "engineering app 1UITests.xctest"
                BlueprintName = "engineering app 1UITests"
-               ReferencedContainer = "container:engineering app 1.xcodeproj">
+               ReferencedContainer = "container:Tolerations - Engineering Notepad.xcodeproj">
             </BuildableReference>
          </TestableReference>
       </Testables>
@@ -72,7 +72,7 @@
             BlueprintIdentifier = "B738F334301C1874000F34C4"
             BuildableName = "engineering app 1.app"
             BlueprintName = "engineering app 1"
-            ReferencedContainer = "container:engineering app 1.xcodeproj">
+            ReferencedContainer = "container:Tolerations - Engineering Notepad.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>
@@ -89,7 +89,7 @@
             BlueprintIdentifier = "B738F334301C1874000F34C4"
             BuildableName = "engineering app 1.app"
             BlueprintName = "engineering app 1"
-            ReferencedContainer = "container:engineering app 1.xcodeproj">
+            ReferencedContainer = "container:Tolerations - Engineering Notepad.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>

@@ -2,13 +2,13 @@
 //  LayoutSettingsView.swift
 //  Tolerance
 //
-//  Preferences for how the home sidebar looks. Opened from the settings box at
-//  the bottom of the sidebar. Stored in UserDefaults via @AppStorage.
+//  Preferences for how the home workspace and new items look.
+//  Opened from the settings sheet in HomeView and backed by @AppStorage.
 //
 
 import SwiftUI
 
-/// Keys shared with HomeView.
+/// Keys shared across HomeView and editor settings.
 enum LayoutPrefs {
     static let showDates = "layout.showDates"
     static let foldersFirst = "layout.foldersFirst"
@@ -19,6 +19,7 @@ enum LayoutPrefs {
 enum LayoutAccent: String, CaseIterable, Identifiable {
     case blue, purple, green, orange, pink
     var id: String { rawValue }
+    
     var color: Color {
         switch self {
         case .blue: return .blue
@@ -31,6 +32,8 @@ enum LayoutAccent: String, CaseIterable, Identifiable {
 }
 
 struct LayoutSettingsView: View {
+    @Environment(\.dismiss) private var dismiss
+
     @AppStorage(LayoutPrefs.showDates) private var showDates = true
     @AppStorage(LayoutPrefs.accentRaw) private var accentRaw = LayoutAccent.blue.rawValue
     @AppStorage(LayoutPrefs.defaultPaperStyle) private var defaultPaperStyleRaw = PaperStyle.grid.rawValue
@@ -38,35 +41,63 @@ struct LayoutSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("New notepad default") {
-                    Picker("Default paper style", selection: $defaultPaperStyleRaw) {
+                // MARK: - Paper Defaults
+                Section("New Derivation Default") {
+                    Picker("Default Paper Style", selection: $defaultPaperStyleRaw) {
                         ForEach(PaperStyle.allCases) { style in
-                            Label(style.displayName, systemImage: style.systemImage).tag(style.rawValue)
+                            Label(style.displayName, systemImage: style.systemImage)
+                                .tag(style.rawValue)
                         }
                     }
+                    .pickerStyle(.menu)
                 }
-                Section("Notepad cards") {
-                    Toggle("Show edited dates", isOn: $showDates)
+
+                // MARK: - Display Settings
+                Section("Card Display") {
+                    Toggle("Show edited dates on cards", isOn: $showDates)
                 }
-                Section("Accent color") {
-                    Picker("Accent", selection: $accentRaw) {
+
+                // MARK: - Accent Color Selection
+                Section("Accent Color") {
+                    HStack(spacing: 16) {
                         ForEach(LayoutAccent.allCases) { accent in
-                            HStack {
-                                Circle().fill(accent.color).frame(width: 16, height: 16)
-                                Text(accent.rawValue.capitalized)
-                            }
-                            .tag(accent.rawValue)
+                            Circle()
+                                .fill(accent.color)
+                                .frame(width: 32, height: 32)
+                                .overlay {
+                                    if accentRaw == accent.rawValue {
+                                        Image(systemName: "checkmark")
+                                            .font(.caption.bold())
+                                            .foregroundStyle(.white)
+                                    }
+                                }
+                                .onTapGesture {
+                                    accentRaw = accent.rawValue
+                                }
+                                .accessibilityLabel(accent.rawValue.capitalized)
+                                .accessibilityAddTraits(accentRaw == accent.rawValue ? .isSelected : [])
                         }
                     }
-                    .pickerStyle(.inline)
-                    .labelsHidden()
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
                 }
             }
             .navigationTitle("Customize Layout")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
         }
         .frame(minWidth: 320, minHeight: 380)
     }
+}
+
+#Preview {
+    LayoutSettingsView()
 }

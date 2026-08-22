@@ -2,88 +2,130 @@
 //  NotepadSettingsView.swift
 //  Tolerance
 //
-//  The paper-style / settings menu opened from the gear (top-right) inside a
-//  notepad. Controls the background paper style, its spacing, and the paper
-//  color. The pen color always follows automatically as the opposite of the
-//  paper. All settings persist with the notepad.
+//  The paper-style / settings menu opened from the top-right popover inside a
+//  notepad. Controls background paper style, grid density, and paper theme.
+//  All settings persist directly with the SwiftData Notepad model.
 //
 
 #if os(iOS)
 import SwiftUI
 
 struct NotepadSettingsView: View {
+    @Environment(\.dismiss) private var dismiss
     @Bindable var notepad: Notepad
 
     private var paperColorBinding: Binding<Color> {
         Binding(
             get: { PaperTheme.color(fromHex: notepad.paperColorHex) },
-            set: { notepad.paperColorHex = PaperTheme.hex(from: $0) })
+            set: {
+                notepad.paperColorHex = PaperTheme.hex(from: $0)
+                notepad.markEdited()
+            }
+        )
     }
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Paper style") {
+                // MARK: - Paper Style Selection
+                Section("Paper Style") {
                     Picker("Style", selection: $notepad.paperStyleRaw) {
                         ForEach(PaperStyle.allCases) { style in
-                            Label(style.displayName, systemImage: style.systemImage).tag(style.rawValue)
+                            Label(style.displayName, systemImage: style.systemImage)
+                                .tag(style.rawValue)
                         }
                     }
                     .pickerStyle(.inline)
                     .labelsHidden()
-                }
-
-                if notepad.paperStyle != .blank {
-                    Section("Grid size") {
-                        Slider(
-                            value: Binding(
-                                get: { Double(notepad.gridColumns) },
-                                set: { notepad.gridColumns = Int($0.rounded()) }
-                            ),
-                            in: 6...40, step: 1
-                        )
-                        Text("\(notepad.gridColumns) boxes per row")
-                            .font(.subheadline)
-                            .frame(maxWidth: .infinity, alignment: .center)
-                            .foregroundStyle(.secondary)
+                    .onChange(of: notepad.paperStyleRaw) { _, _ in
+                        notepad.markEdited()
                     }
                 }
 
-                Section("Paper color") {
+                // MARK: - Grid / Line Spacing
+                if notepad.paperStyle != .blank {
+                    Section("Grid Density") {
+                        VStack(spacing: 8) {
+                            Slider(
+                                value: Binding(
+                                    get: { Double(notepad.gridColumns) },
+                                    set: {
+                                        notepad.gridColumns = Int($0.rounded())
+                                        notepad.markEdited()
+                                    }
+                                ),
+                                in: 6...40,
+                                step: 1
+                            )
+                            
+                            Text("\(notepad.gridColumns) boxes per row")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+
+                // MARK: - Paper Color Presets & Custom
+                Section("Paper Color") {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 44), spacing: 12)], spacing: 12) {
                         ForEach(PaperTheme.presets, id: \.hex) { preset in
-                            presetSwatch(preset.hex)
+                            presetSwatch(preset)
                         }
                     }
-                    .padding(.vertical, 4)
+                    .padding(.vertical, 6)
+
                     ColorPicker("Custom paper color", selection: paperColorBinding, supportsOpacity: false)
                 }
 
+                // MARK: - Information
                 Section {
-                    Label("The pen color is always the opposite of the paper, so ink stays legible.",
-                          systemImage: "pencil.tip")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                    Label(
+                        "The pen color is automatically inverted from the paper background to maintain high legibility.",
+                        systemImage: "pencil.tip"
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
                 }
             }
             .navigationTitle("Paper & Settings")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
         }
         .frame(minWidth: 360, minHeight: 460)
     }
 
-    private func presetSwatch(_ hex: String) -> some View {
-        let isSelected = notepad.paperColorHex.caseInsensitiveCompare(hex) == .orderedSame
+    // MARK: - Swatch Helper
+
+    private func presetSwatch(_ preset: PaperThemePreset) -> some View {
+        let isSelected = notepad.paperColorHex.caseInsensitiveCompare(preset.hex) == .orderedSame
+        let swatchColor = PaperTheme.color(fromHex: preset.hex)
+
         return Button {
-            notepad.paperColorHex = hex
+            notepad.paperColorHex = preset.hex
+            notepad.markEdited()
         } label: {
             RoundedRectangle(cornerRadius: 8)
-                .fill(PaperTheme.color(fromHex: hex))
+                .fill(swatchColor)
                 .frame(height: 44)
-                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.primary.opacity(0.15)))
-                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.accentColor, lineWidth: isSelected ? 3 : 0))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(Color.primary.opacity(0.15), lineWidth: 1)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(Color.accentColor, lineWidth: isSelected ? 3 : 0)
+                )
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(preset.name)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 #endif

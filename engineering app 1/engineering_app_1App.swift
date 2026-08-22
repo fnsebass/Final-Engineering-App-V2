@@ -10,12 +10,14 @@ import SwiftUI
 import SwiftData
 
 @main
-struct ToleranceApp: App {
-    var sharedModelContainer: ModelContainer = ToleranceApp.makeContainer()
+struct DerivationNotesApp: App {
+    var sharedModelContainer: ModelContainer = DerivationNotesApp.makeContainer()
+    @AppStorage("isDarkMode") private var isDarkMode = false
 
     var body: some Scene {
         WindowGroup {
             HomeView()
+                .preferredColorScheme(isDarkMode ? .dark : .light)
         }
         .modelContainer(sharedModelContainer)
     }
@@ -24,7 +26,8 @@ struct ToleranceApp: App {
     /// migrated (e.g. after a schema change during development), the old store
     /// is deleted and recreated so the app never gets stuck in a crash loop.
     private static func makeContainer() -> ModelContainer {
-        let schema = Schema([Notepad.self, Page.self, Folder.self])
+        let schema = Schema([Notepad.self, Page.self, Folder.self, HandwritingCorrection.self,
+                             CircuitDiagram.self, FBDDiagram.self, BeamDiagram.self, VectorFieldDiagram.self])
         let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
         do {

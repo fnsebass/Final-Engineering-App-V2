@@ -49,7 +49,7 @@ final class Notepad {
     /// The folder this notepad belongs to, or nil if it's loose in the sidebar.
     var folder: Folder?
 
-    init(title: String = "Untitled Notepad", createdDate: Date = .now) {
+    init(title: String = "New Derivation", createdDate: Date = .now) {
         self.title = title
         self.createdDate = createdDate
         self.lastEditedDate = createdDate
