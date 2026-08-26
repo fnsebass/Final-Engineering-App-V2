@@ -25,6 +25,7 @@ enum SidebarSelection: Hashable {
     case fbd(PersistentIdentifier)
     case beam(PersistentIdentifier)
     case vectorField(PersistentIdentifier)
+    case truss(PersistentIdentifier)
 }
 
 enum NotepadSort: String, CaseIterable, Identifiable {
@@ -42,6 +43,7 @@ struct HomeView: View {
     @Query(sort: \FBDDiagram.createdDate,         order: .reverse) private var fbds:         [FBDDiagram]
     @Query(sort: \BeamDiagram.createdDate,        order: .reverse) private var beams:        [BeamDiagram]
     @Query(sort: \VectorFieldDiagram.createdDate, order: .reverse) private var vectorFields: [VectorFieldDiagram]
+    @Query(sort: \TrussDiagram.createdDate,       order: .reverse) private var trusses:      [TrussDiagram]
 
     @State private var selection: SidebarSelection? = .loose
     @State private var openNotepadID: PersistentIdentifier?
@@ -71,6 +73,18 @@ struct HomeView: View {
     @State private var vfRenameTarget: VectorFieldDiagram?
     @State private var vfRenameText = ""
     @State private var showVFRenameAlert = false
+    @State private var trussRenameTarget: TrussDiagram?
+    @State private var trussRenameText = ""
+    @State private var showTrussRenameAlert = false
+
+    // Sidebar expand state
+    @State private var specialExpanded       = false
+    @State private var otherProjectsExpanded = false
+    @State private var circuitsExpanded      = true
+    @State private var fbdsExpanded          = true
+    @State private var beamsExpanded         = true
+    @State private var vfsExpanded           = true
+    @State private var trussesExpanded       = true
 
     @AppStorage(LayoutPrefs.showDates)         private var showDates          = true
     @AppStorage(LayoutPrefs.accentRaw)         private var accentRaw          = LayoutAccent.blue.rawValue
@@ -139,6 +153,11 @@ struct HomeView: View {
             Button("Cancel", role: .cancel) { vfRenameTarget = nil }
             Button("Save") { commitVFRename() }
         }
+        .alert("Rename Truss", isPresented: $showTrussRenameAlert) {
+            TextField("Name", text: $trussRenameText)
+            Button("Cancel", role: .cancel) { trussRenameTarget = nil }
+            Button("Save") { commitTrussRename() }
+        }
     }
 
     // MARK: - Detail
@@ -177,6 +196,14 @@ struct HomeView: View {
             })
             .id(id)
             #endif
+        } else if case let .truss(id) = selection,
+                  let truss = modelContext.model(for: id) as? TrussDiagram {
+            #if os(iOS)
+            TrussEditorView(diagram: truss, onBack: {
+                withAnimation { selection = .loose; columnVisibility = .all }
+            })
+            .id(id)
+            #endif
         } else if let openNotepad {
             NotepadEditorView(notepad: openNotepad, onBack: closeNotepad)
                 .id(openNotepad.persistentModelID)
@@ -199,6 +226,8 @@ struct HomeView: View {
 
     private var sidebar: some View {
         List(selection: $selection) {
+
+            // ── Always-visible quick actions ──────────────────────────────
             Section {
                 Button(action: createNotepad) {
                     Label("New Derivation", systemImage: "plus.circle.fill")
@@ -213,7 +242,10 @@ struct HomeView: View {
                     Label("New Project", systemImage: "folder.badge.plus")
                 }
                 .buttonStyle(.plain)
+            }
 
+            // ── Special – engineering tool creators ───────────────────────
+            DisclosureGroup(isExpanded: $specialExpanded) {
                 Button(action: createCircuit) {
                     Label("New Circuit", systemImage: "bolt.circle.fill")
                 }
@@ -233,8 +265,17 @@ struct HomeView: View {
                     Label("New Vector Field", systemImage: "arrow.clockwise.circle.fill")
                 }
                 .buttonStyle(.plain)
+
+                Button(action: createTruss) {
+                    Label("New Truss", systemImage: "network")
+                }
+                .buttonStyle(.plain)
+            } label: {
+                Label("Special", systemImage: "sparkles")
+                    .fontWeight(.semibold)
             }
 
+            // ── Sort ──────────────────────────────────────────────────────
             Section("Sort by") {
                 Picker("Sort by", selection: $sort) {
                     ForEach(NotepadSort.allCases) { Text($0.rawValue).tag($0) }
@@ -243,6 +284,7 @@ struct HomeView: View {
                 .labelsHidden()
             }
 
+            // ── Workspace – notepads & folders ────────────────────────────
             Section("Workspace") {
                 Label("All Derivations", systemImage: "tray.full")
                     .tag(SidebarSelection.loose)
@@ -270,81 +312,97 @@ struct HomeView: View {
                 }
             }
 
-            Section("Circuits") {
-                ForEach(circuits) { circ in
-                    Label(circ.title, systemImage: "bolt.circle.fill")
-                        .tag(SidebarSelection.circuit(circ.persistentModelID))
-                        .contextMenu {
-                            Button { beginCircuitRename(circ) } label: {
-                                Label("Rename", systemImage: "pencil")
-                            }
-                            Button(role: .destructive) { deleteCircuit(circ) } label: {
-                                Label("Delete", systemImage: "trash")
-                            }
-                        }
-                }
-                if circuits.isEmpty {
-                    Text("Tap New Circuit to start.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
+            // ── Other Projects – collapsible engineering diagrams ─────────
+            DisclosureGroup(isExpanded: $otherProjectsExpanded) {
 
-            Section("FBD Diagrams") {
-                ForEach(fbds) { fbd in
-                    Label(fbd.title, systemImage: "arrow.up.and.down.and.arrow.left.and.right")
-                        .tag(SidebarSelection.fbd(fbd.persistentModelID))
-                        .contextMenu {
-                            Button { beginFBDRename(fbd) } label: {
-                                Label("Rename", systemImage: "pencil")
+                DisclosureGroup(isExpanded: $circuitsExpanded) {
+                    ForEach(circuits) { circ in
+                        Label(circ.title, systemImage: "bolt.circle.fill")
+                            .tag(SidebarSelection.circuit(circ.persistentModelID))
+                            .contextMenu {
+                                Button { beginCircuitRename(circ) } label: { Label("Rename", systemImage: "pencil") }
+                                Button(role: .destructive) { deleteCircuit(circ) } label: { Label("Delete", systemImage: "trash") }
                             }
-                            Button(role: .destructive) { deleteFBD(fbd) } label: {
-                                Label("Delete", systemImage: "trash")
-                            }
-                        }
+                    }
+                    if circuits.isEmpty {
+                        Text("Tap Special → New Circuit to start.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } label: {
+                    Label("Circuits", systemImage: "bolt.circle.fill")
                 }
-                if fbds.isEmpty {
-                    Text("Tap New FBD to start.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-            }
 
-            Section("Beam Diagrams") {
-                ForEach(beams) { beam in
-                    Label(beam.title, systemImage: "chart.xyaxis.line")
-                        .tag(SidebarSelection.beam(beam.persistentModelID))
-                        .contextMenu {
-                            Button { beginBeamRename(beam) } label: {
-                                Label("Rename", systemImage: "pencil")
+                DisclosureGroup(isExpanded: $fbdsExpanded) {
+                    ForEach(fbds) { fbd in
+                        Label(fbd.title, systemImage: "arrow.up.and.down.and.arrow.left.and.right")
+                            .tag(SidebarSelection.fbd(fbd.persistentModelID))
+                            .contextMenu {
+                                Button { beginFBDRename(fbd) } label: { Label("Rename", systemImage: "pencil") }
+                                Button(role: .destructive) { deleteFBD(fbd) } label: { Label("Delete", systemImage: "trash") }
                             }
-                            Button(role: .destructive) { deleteBeam(beam) } label: {
-                                Label("Delete", systemImage: "trash")
-                            }
-                        }
+                    }
+                    if fbds.isEmpty {
+                        Text("Tap Special → New FBD to start.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } label: {
+                    Label("FBD Diagrams", systemImage: "arrow.up.and.down.and.arrow.left.and.right")
                 }
-                if beams.isEmpty {
-                    Text("Tap New Beam to start.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-            }
 
-            Section("Vector Fields") {
-                ForEach(vectorFields) { vf in
-                    Label(vf.title, systemImage: "arrow.clockwise.circle.fill")
-                        .tag(SidebarSelection.vectorField(vf.persistentModelID))
-                        .contextMenu {
-                            Button { beginVFRename(vf) } label: {
-                                Label("Rename", systemImage: "pencil")
+                DisclosureGroup(isExpanded: $beamsExpanded) {
+                    ForEach(beams) { beam in
+                        Label(beam.title, systemImage: "chart.xyaxis.line")
+                            .tag(SidebarSelection.beam(beam.persistentModelID))
+                            .contextMenu {
+                                Button { beginBeamRename(beam) } label: { Label("Rename", systemImage: "pencil") }
+                                Button(role: .destructive) { deleteBeam(beam) } label: { Label("Delete", systemImage: "trash") }
                             }
-                            Button(role: .destructive) { deleteVF(vf) } label: {
-                                Label("Delete", systemImage: "trash")
+                    }
+                    if beams.isEmpty {
+                        Text("Tap Special → New Beam to start.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } label: {
+                    Label("Beam Diagrams", systemImage: "chart.xyaxis.line")
+                }
+
+                DisclosureGroup(isExpanded: $vfsExpanded) {
+                    ForEach(vectorFields) { vf in
+                        Label(vf.title, systemImage: "arrow.clockwise.circle.fill")
+                            .tag(SidebarSelection.vectorField(vf.persistentModelID))
+                            .contextMenu {
+                                Button { beginVFRename(vf) } label: { Label("Rename", systemImage: "pencil") }
+                                Button(role: .destructive) { deleteVF(vf) } label: { Label("Delete", systemImage: "trash") }
                             }
-                        }
+                    }
+                    if vectorFields.isEmpty {
+                        Text("Tap Special → New Vector Field to start.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } label: {
+                    Label("Vector Fields", systemImage: "arrow.clockwise.circle.fill")
                 }
-                if vectorFields.isEmpty {
-                    Text("Tap New Vector Field to start.")
-                        .font(.caption).foregroundStyle(.secondary)
+
+                DisclosureGroup(isExpanded: $trussesExpanded) {
+                    ForEach(trusses) { truss in
+                        Label(truss.title, systemImage: "network")
+                            .tag(SidebarSelection.truss(truss.persistentModelID))
+                            .contextMenu {
+                                Button { beginTrussRename(truss) } label: { Label("Rename", systemImage: "pencil") }
+                                Button(role: .destructive) { deleteTruss(truss) } label: { Label("Delete", systemImage: "trash") }
+                            }
+                    }
+                    if trusses.isEmpty {
+                        Text("Tap Special → New Truss to start.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } label: {
+                    Label("Trusses", systemImage: "network")
                 }
+
+            } label: {
+                Label("Other Projects", systemImage: "folder.badge.gearshape")
+                    .fontWeight(.semibold)
             }
         }
         .navigationTitle("Derivation Notes")
@@ -592,6 +650,35 @@ struct HomeView: View {
         let trimmed = vfRenameText.trimmingCharacters(in: .whitespacesAndNewlines)
         target.title = trimmed.isEmpty ? "New Vector Field" : trimmed
         vfRenameTarget = nil
+    }
+
+    // MARK: - Truss CRUD
+
+    private func createTruss() {
+        let t = TrussDiagram(title: "Truss \(trusses.count + 1)")
+        modelContext.insert(t)
+        DispatchQueue.main.async {
+            selection = .truss(t.persistentModelID)
+            withAnimation { columnVisibility = .detailOnly }
+        }
+    }
+
+    private func deleteTruss(_ t: TrussDiagram) {
+        if case let .truss(id) = selection, id == t.persistentModelID { selection = .loose }
+        modelContext.delete(t)
+    }
+
+    private func beginTrussRename(_ t: TrussDiagram) {
+        trussRenameTarget = t
+        trussRenameText   = t.title
+        showTrussRenameAlert = true
+    }
+
+    private func commitTrussRename() {
+        guard let target = trussRenameTarget else { return }
+        let trimmed = trussRenameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        target.title = trimmed.isEmpty ? "New Truss" : trimmed
+        trussRenameTarget = nil
     }
 }
 

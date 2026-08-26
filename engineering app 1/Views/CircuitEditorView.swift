@@ -50,6 +50,15 @@ struct GeneratedCircuitItem {
 
     @Guide(description: "True if this component type normally carries a numeric value.")
     var hasValue: Bool
+
+    @Guide(description: """
+    Parallel branch index. Use 0 for components in the main series path (battery, switches, meters).
+    For parallel branches assign each branch a unique integer starting at 1.
+    Example: two resistors in parallel → R1 gets branch=1, R2 gets branch=2.
+    All components sharing the same junction get the same non-zero branch number only if
+    they are literally in series WITHIN that branch.
+    """)
+    var branch: Int
 }
 
 // MARK: - Main view
@@ -85,6 +94,10 @@ struct CircuitEditorView: View {
     @State private var analysisText = ""
     @State private var isAnalyzing  = false
 
+    // Animation
+    @State private var isAnimating = false
+    @State private var wireFlow: [UUID: Bool] = [:]  // true = start→end, false = end→start
+
     // Setup sheet (shown on first open when canvas is empty)
     @State private var showSetup    = false
     @State private var setupPhase:  SetupPhase = .choice
@@ -112,6 +125,7 @@ struct CircuitEditorView: View {
         .sheet(isPresented: $showSetup)       { setupSheet }
         .sheet(isPresented: $showValueEditor) { valueEditorSheet }
         .sheet(isPresented: $showAnalysis)    { analysisSheet }
+        .onChange(of: isAnimating) { _, on in if on { wireFlow = buildFlowDirections() } }
     }
 
     // MARK: - Toolbar (compact: 36 pt, icon-only palette)
@@ -190,6 +204,22 @@ struct CircuitEditorView: View {
             }
             .buttonStyle(.plain)
             .disabled(selectedID == nil)
+
+            vDivider
+
+            // Animate current flow
+            Button {
+                isAnimating.toggle()
+            } label: {
+                Label(isAnimating ? "Stop" : "Animate", systemImage: isAnimating ? "stop.fill" : "bolt.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(isAnimating ? Color.yellow : Color.secondary)
+                    .padding(.horizontal, 8)
+                    .frame(height: 26)
+                    .background(isAnimating ? Color.yellow.opacity(0.18) : Color.clear, in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 4)
 
             vDivider
 
@@ -309,6 +339,42 @@ struct CircuitEditorView: View {
                         }
                         .frame(width: canvasW, height: canvasH)
                         .allowsHitTesting(false)
+
+                        // Current-flow animation overlay
+                        if isAnimating {
+                            TimelineView(.animation) { tl in
+                                Canvas { ctx, _ in
+                                    let t = tl.date.timeIntervalSinceReferenceDate
+                                    for wire in wires {
+                                        // Respect current-flow direction so all dots move one way
+                                        let forward = wireFlow[wire.id] ?? true
+                                        let a = forward ? wire.start.cgPoint : wire.end.cgPoint
+                                        let b = forward ? wire.end.cgPoint   : wire.start.cgPoint
+                                        let len = hypot(b.x - a.x, b.y - a.y)
+                                        guard len > 8 else { continue }
+                                        let speed = animSpeed(near: wire)
+                                        let spacing: CGFloat = 22
+                                        let phase = CGFloat(t * speed * 55)
+                                            .truncatingRemainder(dividingBy: spacing)
+                                        var d = phase
+                                        while d < len {
+                                            let frac = d / len
+                                            let px = a.x + (b.x - a.x) * frac
+                                            let py = a.y + (b.y - a.y) * frac
+                                            let r: CGFloat = speed > 1.5 ? 4 : speed < 0.5 ? 2 : 3
+                                            ctx.fill(
+                                                Path(ellipseIn: CGRect(x: px-r, y: py-r,
+                                                                       width: r*2, height: r*2)),
+                                                with: .color(Color.yellow.opacity(0.9))
+                                            )
+                                            d += spacing
+                                        }
+                                    }
+                                }
+                                .frame(width: canvasW, height: canvasH)
+                                .allowsHitTesting(false)
+                            }
+                        }
 
                         // Components
                         ForEach(components) { comp in
@@ -686,11 +752,16 @@ struct CircuitEditorView: View {
         guard isAIAvailable else { showSetup = false; return }
 
         let instructions = """
-        You are a circuit schematic assistant.
-        Output a list of components in order from battery positive terminal around the loop.
-        Use ONLY these type strings: resistor, battery, capacitor, inductor, led,
-        switchComp, ground, voltmeter, ammeter.
-        Provide sensible default values where not specified.
+        You are a circuit schematic assistant. Output a flat list of ALL components in the circuit.
+
+        SERIES components (battery, switches, meters, and any single-path component): set branch=0.
+        PARALLEL branches: each distinct parallel branch gets a unique branch number ≥ 1.
+          - Two resistors in parallel → R1 has branch=1, R2 has branch=2.
+          - Three resistors in parallel → branch=1, branch=2, branch=3.
+          - If a parallel branch itself contains multiple series components, give them the SAME branch number.
+
+        Use ONLY these type strings: resistor, battery, capacitor, inductor, led, switchComp, ground, voltmeter, ammeter.
+        Provide sensible default values. Always include the battery with branch=0.
         """
 
         do {
@@ -705,61 +776,107 @@ struct CircuitEditorView: View {
         showSetup = false
     }
 
-    // Place components centred in the visible viewport, then scroll to them.
+    // Place components centred in the visible viewport, supporting series and parallel topologies.
     private func placeGeneratedCircuit(_ items: [GeneratedCircuitItem]) {
         guard !items.isEmpty else { return }
-
-        // Centre of visible area (scroll starts at origin so viewport centre = canvas offset)
         let cx = viewportSize.width  / 2
         let cy = viewportSize.height / 2
 
-        let step: CGFloat = 180
-        let totalW = step * CGFloat(items.count - 1)
-        let startX = cx - totalW / 2
+        let seriesItems   = items.filter { $0.branch == 0 }
+        let parallelGroups = Dictionary(grouping: items.filter { $0.branch > 0 }, by: { $0.branch })
 
-        var placed: [CircuitComponent] = []
-        for (i, item) in items.enumerated() {
+        var placed:   [CircuitComponent] = []
+        var newWires: [CircuitWire]      = []
+
+        func w(_ x1: CGFloat, _ y1: CGFloat, _ x2: CGFloat, _ y2: CGFloat) {
+            newWires.append(CircuitWire(start: CircuitPoint(x: Double(x1), y: Double(y1)),
+                                        end:   CircuitPoint(x: Double(x2), y: Double(y2))))
+        }
+
+        func comp(_ item: GeneratedCircuitItem, x: CGFloat, y: CGFloat) -> CircuitComponent {
             let type = CircuitComponentType.allCases.first {
                 $0.rawValue.lowercased() == item.type.lowercased()
             } ?? .resistor
-
-            var comp = CircuitComponent(
-                type: type,
-                x: Double(startX + step * CGFloat(i)),
-                y: Double(cy),
-                label: item.label.isEmpty ? nextLabel(for: type) : item.label
-            )
-            if item.hasValue && item.value != 0 { comp.value = item.value }
-            placed.append(comp)
+            var c = CircuitComponent(type: type, x: Double(x), y: Double(y),
+                                     label: item.label.isEmpty ? diagram.nextLabel(for: type) : item.label)
+            if item.hasValue && item.value != 0 { c.value = item.value }
+            return c
         }
 
-        // Series wires
-        var newWires: [CircuitWire] = []
-        for i in 0..<placed.count - 1 {
-            newWires.append(CircuitWire(
-                start: CircuitPoint(x: placed[i].x + 44,     y: placed[i].y),
-                end:   CircuitPoint(x: placed[i + 1].x - 44, y: placed[i + 1].y)
-            ))
-        }
-        // Return loop below
-        if placed.count > 1 {
-            let first = placed.first!; let last = placed.last!
-            let loopY = cy + 100
-            newWires += [
-                CircuitWire(start: CircuitPoint(x: first.x - 44, y: first.y),
-                            end:   CircuitPoint(x: first.x - 44, y: loopY)),
-                CircuitWire(start: CircuitPoint(x: first.x - 44, y: loopY),
-                            end:   CircuitPoint(x: last.x  + 44, y: loopY)),
-                CircuitWire(start: CircuitPoint(x: last.x  + 44, y: loopY),
-                            end:   CircuitPoint(x: last.x  + 44, y: last.y))
-            ]
+        if parallelGroups.isEmpty {
+            // ── Pure series ──
+            let step: CGFloat = 180
+            let x0 = cx - step * CGFloat(items.count - 1) / 2
+            for (i, item) in items.enumerated() {
+                placed.append(comp(item, x: x0 + step * CGFloat(i), y: cy))
+            }
+            for i in 0..<placed.count - 1 {
+                w(placed[i].x + 44, placed[i].y, placed[i+1].x - 44, placed[i+1].y)
+            }
+            if placed.count > 1 {
+                let loopY = cy + 110
+                let fx = CGFloat(placed.first!.x) - 44, lx = CGFloat(placed.last!.x) + 44
+                w(fx, cy, fx, loopY); w(fx, loopY, lx, loopY); w(lx, loopY, lx, cy)
+            }
+        } else {
+            // ── Series + parallel ──
+            let nBranches     = parallelGroups.count
+            let branchSpacing: CGFloat = 90
+            let parallelW:     CGFloat = 220
+            let jLX = cx - parallelW / 2
+            let jRX = cx + parallelW / 2
+            let seriesStep:   CGFloat = 160
+
+            // Place series items to the left of the parallel block
+            let seriesX0 = jLX - seriesStep * CGFloat(max(seriesItems.count, 1))
+            for (i, item) in seriesItems.enumerated() {
+                placed.append(comp(item, x: seriesX0 + seriesStep * (CGFloat(i) + 0.5), y: cy))
+            }
+
+            // Series wires + wire to left junction
+            for i in 0..<placed.count - 1 {
+                w(placed[i].x + 44, placed[i].y, placed[i+1].x - 44, placed[i+1].y)
+            }
+            if let last = placed.last {
+                w(last.x + 44, last.y, jLX, cy)
+            }
+
+            // Parallel branches
+            let sortedBranch = parallelGroups.keys.sorted()
+            for (bi, key) in sortedBranch.enumerated() {
+                let branchComps = parallelGroups[key]!
+                let branchY = cy + (CGFloat(bi) - CGFloat(nBranches - 1) / 2) * branchSpacing
+                let bStep   = parallelW / CGFloat(branchComps.count + 1)
+
+                // Vertical wires from main line to branch
+                w(jLX, cy, jLX, branchY)
+                w(jRX, branchY, jRX, cy)
+
+                // Components in branch + horizontal wires
+                var lastX: CGFloat = jLX
+                for (ci, item) in branchComps.enumerated() {
+                    let bx = jLX + bStep * CGFloat(ci + 1)
+                    let c = comp(item, x: bx, y: branchY)
+                    placed.append(c)
+                    w(lastX, branchY, bx - 44, branchY)
+                    lastX = bx + 44
+                }
+                w(lastX, branchY, jRX, branchY)
+            }
+
+            // Return loop from jRX back to start
+            let totalH  = CGFloat(nBranches - 1) * branchSpacing
+            let loopY   = cy + totalH / 2 + 80
+            let firstX  = placed.isEmpty ? jLX - 44 : CGFloat(placed.first!.x) - 44
+            w(jRX, cy, jRX + 60, cy)
+            w(jRX + 60, cy, jRX + 60, loopY)
+            w(jRX + 60, loopY, firstX, loopY)
+            w(firstX, loopY, firstX, cy)
         }
 
         components = placed
         wires      = newWires
         saveChanges()
-
-        // Signal the scroll reader to centre the viewport on the generated circuit
         generatedAnchor = CGPoint(x: cx, y: cy)
     }
 
@@ -818,6 +935,72 @@ struct CircuitEditorView: View {
         }
 
         isAnalyzing = false
+    }
+
+    // BFS from battery + terminal to assign a consistent current-flow direction
+    // to every wire. Returns true = flow start→end, false = flow end→start.
+    private func buildFlowDirections() -> [UUID: Bool] {
+        var dir = [UUID: Bool]()
+        let threshold: CGFloat = 60
+
+        // Locate battery and its + terminal (right side at rotation 0; adjust for rotation)
+        guard let battery = components.first(where: { $0.type == .battery }) else {
+            // No battery: default all forward
+            return Dictionary(uniqueKeysWithValues: wires.map { ($0.id, true) })
+        }
+        let rad = battery.rotation * .pi / 180
+        let posX = battery.x + 44 * cos(rad)
+        let posY = battery.y + 44 * sin(rad)
+        let seed = CGPoint(x: posX, y: posY)
+
+        // BFS: start from wires touching the + terminal
+        var frontier: [CGPoint] = []
+        for wire in wires {
+            let s = wire.start.cgPoint, e = wire.end.cgPoint
+            if hypot(seed.x - s.x, seed.y - s.y) < threshold {
+                dir[wire.id] = true; frontier.append(e)
+            } else if hypot(seed.x - e.x, seed.y - e.y) < threshold {
+                dir[wire.id] = false; frontier.append(s)
+            }
+        }
+
+        // Expand BFS through connected wire endpoints
+        var visited = Set(dir.keys)
+        while !frontier.isEmpty {
+            let pt = frontier.removeFirst()
+            for wire in wires where !visited.contains(wire.id) {
+                let s = wire.start.cgPoint, e = wire.end.cgPoint
+                if hypot(pt.x - s.x, pt.y - s.y) < threshold {
+                    dir[wire.id] = true; visited.insert(wire.id); frontier.append(e)
+                } else if hypot(pt.x - e.x, pt.y - e.y) < threshold {
+                    dir[wire.id] = false; visited.insert(wire.id); frontier.append(s)
+                }
+            }
+        }
+
+        // Fallback for disconnected wires
+        for wire in wires where dir[wire.id] == nil { dir[wire.id] = true }
+        return dir
+    }
+
+    // Returns dot speed for a wire based on proximity to component types.
+    private func animSpeed(near wire: CircuitWire) -> Double {
+        let mx = (wire.start.x + wire.end.x) / 2
+        let my = (wire.start.y + wire.end.y) / 2
+        for comp in components {
+            let d = hypot(comp.x - mx, comp.y - my)
+            if d < 90 {
+                switch comp.type {
+                case .resistor:  return 0.3
+                case .battery:   return 2.5
+                case .led:       return 1.5
+                case .capacitor: return 0.08
+                case .inductor:  return 0.5
+                default:         return 1.0
+                }
+            }
+        }
+        return 1.0
     }
 }
 

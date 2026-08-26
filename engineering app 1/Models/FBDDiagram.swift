@@ -33,7 +33,7 @@ enum FBDForceType: String, Codable, CaseIterable {
     var defaultHex: String {
         switch self {
         case .applied:  return "#007AFF"
-        case .weight:   return "#1C1C1E"
+        case .weight:   return "#FF3B30"
         case .normal:   return "#34C759"
         case .friction: return "#FF9500"
         case .tension:  return "#AF52DE"

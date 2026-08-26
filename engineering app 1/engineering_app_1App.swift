@@ -27,7 +27,8 @@ struct DerivationNotesApp: App {
     /// is deleted and recreated so the app never gets stuck in a crash loop.
     private static func makeContainer() -> ModelContainer {
         let schema = Schema([Notepad.self, Page.self, Folder.self, HandwritingCorrection.self,
-                             CircuitDiagram.self, FBDDiagram.self, BeamDiagram.self, VectorFieldDiagram.self])
+                             CircuitDiagram.self, FBDDiagram.self, BeamDiagram.self, VectorFieldDiagram.self,
+                             TrussDiagram.self])
         let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
         do {
