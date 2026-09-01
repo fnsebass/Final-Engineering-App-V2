@@ -28,7 +28,7 @@ struct DerivationNotesApp: App {
     private static func makeContainer() -> ModelContainer {
         let schema = Schema([Notepad.self, Page.self, Folder.self, HandwritingCorrection.self,
                              CircuitDiagram.self, FBDDiagram.self, BeamDiagram.self, VectorFieldDiagram.self,
-                             TrussDiagram.self])
+                             TrussDiagram.self, CanvasPhoto.self])
         let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
         do {

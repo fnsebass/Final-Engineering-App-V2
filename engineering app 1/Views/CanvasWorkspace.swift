@@ -10,7 +10,9 @@
 //      original action (graph/check/chem/AI). Confirmed corrections are
 //      saved as HandwritingCorrection entries and reused automatically.
 //    • Ruler overlay
-//    • Graph and AI side-panel overlays
+//    • Graph: floating card (drag header to move, top-left handle to resize)
+//    • Left graph drawer (pin button docks graph; arrow tab reveals it)
+//    • Photo import, placement, resize, and rotation
 //    • Apple Pencil squeeze-to-erase
 //
 //  activeTool / penColor / rulerActive come in as bindings from the parent.
@@ -20,6 +22,7 @@
 #if os(iOS)
 import SwiftUI
 import SwiftData
+import PhotosUI
 
 // MARK: - Pending action enum
 
@@ -34,6 +37,9 @@ struct CanvasWorkspace: View {
     @Binding var activeTool: DrawingTool
     @Binding var penColor: Color
     @Binding var rulerActive: Bool
+    @Binding var isVerifyMode: Bool
+    @Binding var showPhotoPicker: Bool
+    let activeShapeKind: ShapeKind
 
     // Stored handwriting corrections (applied automatically before every action)
     @Query(sort: \HandwritingCorrection.useCount, order: .reverse)
@@ -59,10 +65,27 @@ struct CanvasWorkspace: View {
     // Ruler
     @State private var rulerY: CGFloat = 300
 
-    // Graph
+    // Graph — OCR/disambiguation
     @State private var showGraph = false
     @State private var graphEquationText: String = ""
     @State private var graphExpression: String = ""
+    @State private var graphForce3D: Bool? = nil
+    @State private var showGraphModeChoice = false
+    @State private var pendingGraphImage: UIImage? = nil
+
+    // Graph — floating card position & size
+    @State private var graphCardCenter: CGPoint? = nil
+    @State private var graphCardWidth: CGFloat = 540
+
+    // Graph — left drawer / pin
+    @State private var graphIsPinned = false
+    @State private var graphDrawerOpen = false
+    @State private var drawerTypeExpr: String = ""
+    @State private var drawerFocused = false
+
+    // Photos
+    @State private var selectedPhotoID: PersistentIdentifier? = nil
+    @State private var pendingPhotoItems: [PhotosPickerItem] = []
 
     // Pencil squeeze-to-erase state
     @State private var toolBeforeErase: DrawingTool? = nil
@@ -88,6 +111,7 @@ struct CanvasWorkspace: View {
                         activeTool: $activeTool,
                         penColor: $penColor,
                         penWidth: 3,
+                        activeShapeKind: activeShapeKind,
                         onLongPressPreview: { pos in
                             withAnimation(.easeIn(duration: 0.12)) { holdPos = pos }
                         },
@@ -103,6 +127,10 @@ struct CanvasWorkspace: View {
                         onPencilSqueezeEnded: handleSqueezeEnded
                     )
                     .ignoresSafeArea(.container, edges: .bottom)
+
+                    // ── Photo layer (above canvas, below other overlays) ─
+                    photoLayer(for: page)
+                        .zIndex(1)
                 } else {
                     ProgressView("Preparing…").onAppear(perform: ensurePage)
                 }
@@ -149,18 +177,45 @@ struct CanvasWorkspace: View {
                         .zIndex(5)
                 }
 
-                // ── Graph overlay ─────────────────────────────────────────
-                if showGraph {
+                // ── Left graph drawer ──────────────────────────────────────
+                graphDrawer(geo: geo)
+                    .zIndex(7)
+
+                // ── Floating graph card ────────────────────────────────────
+                if showGraph && !graphIsPinned, let center = graphCardCenter {
                     EquationGraphView(
                         equationText: graphEquationText,
                         expression: graphExpression,
-                        isPresented: $showGraph
+                        forceIs3D: graphForce3D,
+                        isPresented: $showGraph,
+                        onHeaderDrag: { delta in
+                            let oldCenter = graphCardCenter ?? center
+                            let hw = graphCardWidth / 2
+                            let newX = (oldCenter.x + delta.width).clamped(to: hw ... geo.size.width - hw)
+                            let newY = (oldCenter.y + delta.height).clamped(to: 60 ... geo.size.height - 60)
+                            graphCardCenter = CGPoint(x: newX, y: newY)
+                        },
+                        onTopLeftResize: { delta in
+                            // Right edge stays fixed; left edge moves → width changes
+                            let newW = max(300, graphCardWidth - delta.width)
+                            let dw   = graphCardWidth - newW
+                            graphCardWidth = newW
+                            // Center shifts right by half the width lost
+                            if let c = graphCardCenter {
+                                let newX = (c.x + dw / 2).clamped(to: newW / 2 ... geo.size.width - newW / 2)
+                                graphCardCenter = CGPoint(x: newX, y: c.y)
+                            }
+                        },
+                        onPin: {
+                            withAnimation(.spring(response: 0.3)) {
+                                graphIsPinned  = true
+                                graphDrawerOpen = true
+                            }
+                        }
                     )
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 16)
-                    .frame(maxWidth: 600)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .frame(width: graphCardWidth)
+                    .position(center)
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
                     .zIndex(8)
                 }
 
@@ -186,11 +241,88 @@ struct CanvasWorkspace: View {
                     .zIndex(15)
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
+
+                // ── Box-to-Verify overlay (Gemini Vision) ─────────────────────────
+                if isVerifyMode {
+                    let globalOrigin = geo.frame(in: .global).origin
+                    BoxVerifyOverlay(
+                        captureRegion: { rect in
+                            // Run on the main thread — UIKit rendering APIs require this.
+                            await MainActor.run { [globalOrigin] in
+                                guard let scene = UIApplication.shared.connectedScenes
+                                    .first as? UIWindowScene,
+                                    let window = scene.windows.first(where: { $0.isKeyWindow })
+                                              ?? scene.windows.first else { return nil }
+
+                                let scale = window.screen.scale
+                                let renderer = UIGraphicsImageRenderer(bounds: window.bounds)
+
+                                // afterScreenUpdates: false — captures the most recently
+                                // committed frame. BoxVerifyOverlay set itself opacity:0
+                                // 100 ms ago, so this frame shows clean canvas content.
+                                let full = renderer.image { _ in
+                                    window.drawHierarchy(in: window.bounds,
+                                                         afterScreenUpdates: false)
+                                }
+
+                                // Convert canvas-local selection rect → window pixel rect.
+                                // globalOrigin: canvas origin in global (window) coordinates.
+                                // rect:         selection in canvas-local points.
+                                // Multiply by scale to get physical pixel coordinates.
+                                let pixelRect = CGRect(
+                                    x: (globalOrigin.x + rect.minX) * scale,
+                                    y: (globalOrigin.y + rect.minY) * scale,
+                                    width:  rect.width  * scale,
+                                    height: rect.height * scale
+                                )
+
+                                guard pixelRect.width > 4, pixelRect.height > 4,
+                                      let cropped = full.cgImage?.cropping(to: pixelRect)
+                                else { return nil }
+
+                                return UIImage(cgImage: cropped,
+                                              scale: scale, orientation: .up).pngData()
+                            }
+                        },
+                        onDismiss: { isVerifyMode = false }
+                    )
+                    .ignoresSafeArea()
+                    .zIndex(18)
+                    .transition(.opacity)
+                }
             }
             .animation(.spring(response: 0.25, dampingFraction: 0.85), value: menuPos != nil)
             .animation(.spring(response: 0.3,  dampingFraction: 0.8),  value: holdPos != nil)
-            .animation(.easeInOut(duration: 0.3), value: showGraph)
+            .animation(.easeInOut(duration: 0.28), value: showGraph)
             .animation(.spring(response: 0.3, dampingFraction: 0.85), value: disambiguationQueue.isEmpty)
+            .animation(.spring(response: 0.3, dampingFraction: 0.85), value: graphDrawerOpen)
+            .photosPicker(isPresented: $showPhotoPicker,
+                          selection: $pendingPhotoItems,
+                          maxSelectionCount: 5,
+                          matching: .images)
+            .onChange(of: pendingPhotoItems) { _, items in
+                Task { await importPhotos(items, canvasSize: geo.size) }
+            }
+            .confirmationDialog("Plot as…", isPresented: $showGraphModeChoice, titleVisibility: .visible) {
+                Button("2-D  (y = f(x))")    { startGraph(force3D: false) }
+                Button("3-D  (z = f(x,y))") { startGraph(force3D: true) }
+                Button("Auto-Detect")        { startGraph(force3D: nil) }
+                Button("Cancel", role: .cancel) { pendingGraphImage = nil }
+            } message: {
+                Text("Choose how to plot this expression")
+            }
+            .onChange(of: showGraph) { _, show in
+                if show && graphCardCenter == nil {
+                    graphCardCenter = CGPoint(
+                        x: geo.size.width / 2,
+                        y: geo.size.height - 260
+                    )
+                    graphCardWidth = min(540, geo.size.width - 32)
+                }
+                if !show && !graphIsPinned {
+                    graphCardCenter = nil
+                }
+            }
         }
         .inspector(isPresented: $showPanel) {
             AIResultPanel(
@@ -204,10 +336,120 @@ struct CanvasWorkspace: View {
                 chemistryResult: chemistryResult,
                 isAnalyzing: isAnalyzing,
                 onRerun: rerunAnalysis,
-                onClose: { showPanel = false; isAnalyzing = false }
+                onClose: { showPanel = false; isAnalyzing = false; resetPanelState() }
             )
         }
         .onAppear(perform: ensurePage)
+    }
+
+    // MARK: - Photo layer
+
+    @ViewBuilder
+    private func photoLayer(for page: Page) -> some View {
+        ForEach(page.photos) { photo in
+            let pid = photo.id
+            PhotoCardView(
+                photo: photo,
+                isSelected: selectedPhotoID == pid,
+                onSelect: { selectedPhotoID = selectedPhotoID == pid ? nil : pid },
+                onDelete: { selectedPhotoID = nil; modelContext.delete(photo) }
+            )
+        }
+    }
+
+    // MARK: - Left graph drawer
+
+    @ViewBuilder
+    private func graphDrawer(geo: GeometryProxy) -> some View {
+        let drawerW: CGFloat = 330
+        ZStack(alignment: .leading) {
+            // Drawer panel content
+            VStack(spacing: 0) {
+                // Quick-graph type-in field
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Quick Graph", systemImage: "function")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    HStack(spacing: 6) {
+                        TextField("e.g. x^2 + sin(x)", text: $drawerTypeExpr)
+                            .font(.system(.body, design: .monospaced))
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                            .submitLabel(.go)
+                            .onSubmit { launchDrawerGraph(in: geo) }
+
+                        Button("Plot") { launchDrawerGraph(in: geo) }
+                            .font(.caption.weight(.semibold))
+                            .buttonStyle(.borderedProminent)
+                            .disabled(drawerTypeExpr.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                }
+                .padding(14)
+                .background(Color(.systemGray6))
+
+                Divider()
+
+                // Pinned graph (or placeholder)
+                if graphIsPinned && showGraph {
+                    EquationGraphView(
+                        equationText: graphEquationText,
+                        expression: graphExpression,
+                        forceIs3D: graphForce3D,
+                        isPresented: $showGraph
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .overlay(alignment: .topTrailing) {
+                        Button {
+                            withAnimation(.spring(response: 0.3)) {
+                                graphIsPinned = false
+                                graphCardCenter = CGPoint(
+                                    x: geo.size.width / 2,
+                                    y: geo.size.height - 260
+                                )
+                            }
+                        } label: {
+                            Image(systemName: "pin.slash")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(8)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(6)
+                    }
+                } else {
+                    ContentUnavailableView {
+                        Label("No Graph", systemImage: "chart.line.uptrend.xyaxis")
+                    } description: {
+                        Text("Type an equation above, or graph from the canvas and tap the pin button.")
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .frame(width: drawerW)
+            .background(.regularMaterial)
+            .offset(x: graphDrawerOpen ? 0 : -drawerW)
+
+            // Arrow tab — always at the right edge of the (possibly hidden) drawer
+            Button {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                    graphDrawerOpen.toggle()
+                }
+            } label: {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(.regularMaterial)
+                        .shadow(color: .black.opacity(0.18), radius: 4, x: 2)
+                    Image(systemName: graphDrawerOpen ? "chevron.left" : "chevron.right")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(width: 22, height: 52)
+            }
+            .buttonStyle(.plain)
+            .offset(x: graphDrawerOpen ? drawerW : 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
 
     // MARK: - Pencil squeeze-to-erase
@@ -244,7 +486,6 @@ struct CanvasWorkspace: View {
 
     // MARK: - Stored-correction application
 
-    /// Applies all stored corrections to `text` and increments their use counts.
     private func applyStoredCorrections(_ text: String) -> String {
         var result = text
         for c in storedCorrections where result.contains(c.ocrFragment) {
@@ -260,11 +501,9 @@ struct CanvasWorkspace: View {
         guard disambiguationIndex < disambiguationQueue.count else { return }
         let current = disambiguationQueue[disambiguationIndex]
 
-        // Apply correction to working text
         disambiguationWorkingText = disambiguationWorkingText
             .replacingOccurrences(of: current.ocrFragment, with: correctionText)
 
-        // Save to memory only when the user actually picked a different value
         if correctionText != current.ocrFragment {
             let snippet = String(disambiguationWorkingText.prefix(40))
             let entry = HandwritingCorrection(
@@ -316,15 +555,23 @@ struct CanvasWorkspace: View {
     private func handleGraph() {
         guard let image = menuImage else { menuPos = nil; return }
         menuPos = nil; menuImage = nil
+        pendingGraphImage = image
+        showGraphModeChoice = true
+    }
+
+    private func startGraph(force3D: Bool?) {
+        guard let image = pendingGraphImage else { return }
+        pendingGraphImage = nil
+        graphForce3D = force3D
         Task {
-            let rawOCR   = await EquationOCR.recognize(in: image)
+            let rawOCR    = await EquationOCR.recognize(in: image)
             let corrected = applyStoredCorrections(rawOCR)
             let ambiguities = await reviewService.findAmbiguities(in: corrected)
             if !ambiguities.isEmpty {
                 disambiguationWorkingText = corrected
-                disambiguationQueue = ambiguities
-                disambiguationIndex = 0
-                pendingCanvasAction = .graph
+                disambiguationQueue       = ambiguities
+                disambiguationIndex       = 0
+                pendingCanvasAction       = .graph
             } else {
                 await continueGraph(with: corrected)
             }
@@ -336,6 +583,18 @@ struct CanvasWorkspace: View {
         let expr   = aiExpr ?? MathEvaluator.extractExpression(from: text) ?? text
         graphEquationText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         graphExpression   = expr
+        withAnimation { showGraph = true }
+    }
+
+    /// Type-in graph from the drawer panel.
+    private func launchDrawerGraph(in geo: GeometryProxy) {
+        let expr = drawerTypeExpr.trimmingCharacters(in: .whitespaces)
+        guard !expr.isEmpty else { return }
+        graphEquationText = expr
+        graphExpression   = expr
+        graphForce3D      = nil
+        graphIsPinned     = true
+        graphDrawerOpen   = true
         withAnimation { showGraph = true }
     }
 
@@ -407,22 +666,31 @@ struct CanvasWorkspace: View {
     private func handleAI() {
         guard let image = menuImage else { menuPos = nil; return }
         menuPos = nil; menuImage = nil
+
+        // Send the long-press screenshot directly to Gemini Vision —
+        // no OCR step needed, the model reads the image directly.
+        guard let imageData = image.pngData() else { return }
         panelMode = .explain
         showPanel = true
         isAnalyzing = true
         resetPanelState()
+        recognizedText = "Analyzing with Gemini Vision…"
         Task {
-            let rawOCR    = await EquationOCR.recognize(in: image)
-            let corrected = applyStoredCorrections(rawOCR)
-            recognizedText = corrected
-            let ambiguities = await reviewService.findAmbiguities(in: corrected)
-            if !ambiguities.isEmpty {
-                disambiguationWorkingText = corrected
-                disambiguationQueue = ambiguities
-                disambiguationIndex = 0
-                pendingCanvasAction = .ai
-            } else {
-                await continueAI(with: corrected)
+            do {
+                let text = try await GeminiVisionService.verify(imageData: imageData)
+                await MainActor.run {
+                    recognizedText = ""
+                    explanation = AIReviewResult(state: .reviewed, reviewText: text)
+                    isAnalyzing = false
+                }
+            } catch {
+                await MainActor.run {
+                    explanation = AIReviewResult(
+                        state: .failed(reason: error.localizedDescription),
+                        reviewText: nil
+                    )
+                    isAnalyzing = false
+                }
             }
         }
     }
@@ -456,6 +724,118 @@ struct CanvasWorkspace: View {
         case .explain:
             explanation = nil
             Task { await continueAI(with: text) }
+        }
+    }
+
+    // MARK: - Photo import
+
+    private func importPhotos(_ items: [PhotosPickerItem], canvasSize: CGSize) async {
+        for item in items {
+            guard let data = try? await item.loadTransferable(type: Data.self),
+                  let ui   = UIImage(data: data) else { continue }
+
+            // Fit the photo so its longest side is ~280 pt on the canvas
+            let maxSide: CGFloat = 280
+            let ratio = min(maxSide / ui.size.width, maxSide / ui.size.height)
+            let w = ui.size.width  * ratio
+            let h = ui.size.height * ratio
+
+            // Place at center of visible canvas area with slight random offset
+            let cx = canvasSize.width  / 2 + CGFloat.random(in: -40...40)
+            let cy = canvasSize.height / 2 + CGFloat.random(in: -40...40)
+
+            let photo = CanvasPhoto(imageData: data, x: cx, y: cy, width: w, height: h)
+            if let page = notepad.orderedPages.first {
+                photo.page = page
+                modelContext.insert(photo)
+            }
+        }
+        pendingPhotoItems = []
+    }
+}
+
+// MARK: - Comparable CGFloat clamping helper
+
+private extension Comparable {
+    func clamped(to range: ClosedRange<Self>) -> Self {
+        min(max(self, range.lowerBound), range.upperBound)
+    }
+}
+
+// MARK: - Photo card view
+
+private struct PhotoCardView: View {
+    @Bindable var photo: CanvasPhoto
+    let isSelected: Bool
+    let onSelect:  () -> Void
+    let onDelete:  () -> Void
+
+    @GestureState private var dragDelta:  CGSize  = .zero
+    @GestureState private var scaleExtra: CGFloat = 1.0
+    @GestureState private var rotExtra:   Angle   = .zero
+
+    private var displayImage: Image? {
+        UIImage(data: photo.imageData).map { Image(uiImage: $0) }
+    }
+
+    var body: some View {
+        ZStack {
+            (displayImage ?? Image(systemName: "photo"))
+                .resizable()
+                .scaledToFill()
+                .frame(width:  photo.width  * scaleExtra,
+                       height: photo.height * scaleExtra)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .rotationEffect(.degrees(photo.rotationDegrees) + rotExtra)
+                .overlay {
+                    if isSelected {
+                        RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(.blue, lineWidth: 2.5)
+                    }
+                }
+
+            // Delete button (shown when selected)
+            if isSelected {
+                Button(action: onDelete) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(.white, .red)
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .offset(x: 12, y: -12)
+            }
+        }
+        .position(x: photo.x + dragDelta.width,
+                  y: photo.y + dragDelta.height)
+        .onTapGesture { onSelect() }
+        .gesture(
+            DragGesture()
+                .updating($dragDelta) { v, state, _ in state = v.translation }
+                .onEnded { v in
+                    photo.x += v.translation.width
+                    photo.y += v.translation.height
+                }
+        )
+        .simultaneousGesture(
+            MagnificationGesture()
+                .updating($scaleExtra) { v, state, _ in state = v }
+                .onEnded { v in
+                    photo.width  = max(60, photo.width  * v)
+                    photo.height = max(60, photo.height * v)
+                }
+        )
+        .simultaneousGesture(
+            RotationGesture()
+                .updating($rotExtra) { v, state, _ in state = v }
+                .onEnded { v in
+                    photo.rotationDegrees += v.degrees
+                }
+        )
+        .contextMenu {
+            Button(role: .destructive, action: onDelete) {
+                Label("Delete Photo", systemImage: "trash")
+            }
         }
     }
 }

@@ -55,14 +55,16 @@ struct TrussEditorView: View {
     @State private var selectedNodeID: UUID? = nil
 
     // Analysis
-    @State private var results:       [UUID: MemberResult] = [:]
-    @State private var showBreakAlert = false
-    @State private var breakMessage   = ""
+    @State private var results:        [UUID: MemberResult] = [:]
+    @State private var showBreakAlert  = false
+    @State private var breakMessage    = ""
+    @State private var analysisMessage: String? = nil
 
     // Car
-    @State private var useCarLoad   = false
-    @State private var carPosition: Double = 0.5
-    @State private var carAnimating = false
+    @State private var useCarLoad    = false
+    @State private var carPosition:  Double = 0.5
+    @State private var carAnimating  = false
+    @State private var carFloorLevel: Int = 0
 
     // Load sheet
     @State private var showLoadSheet  = false
@@ -134,8 +136,23 @@ struct TrussEditorView: View {
                 }
 
                 if showBreakAlert { breakAlertOverlay }
+
+                if let msg = analysisMessage {
+                    Text(msg)
+                        .font(.caption)
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color.orange.opacity(0.88), in: Capsule())
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                        .padding(.top, 10)
+                        .allowsHitTesting(false)
+                }
             }
-            .onGeometryChange(for: CGSize.self) { $0.size } action: { canvasSize = $0 }
+            .onGeometryChange(for: CGSize.self) { $0.size } action: { newSize in
+                canvasSize = newSize
+                injectFloorIfNeeded()
+            }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             if useCarLoad {
@@ -148,6 +165,7 @@ struct TrussEditorView: View {
             nodes   = diagram.loadNodes()
             members = diagram.loadMembers()
             loads   = diagram.loadLoads()
+            injectFloorIfNeeded()
         }
         .task(id: carAnimating) {
             guard carAnimating else { return }
@@ -165,7 +183,13 @@ struct TrussEditorView: View {
             }
             carAnimating = false
         }
-        .onChange(of: useCarLoad) { _, on in if on { runAnalysis() } }
+        .onChange(of: useCarLoad) { _, on in
+            if on {
+                // Default to the bottom chord (highest Y in canvas coords)
+                carFloorLevel = max(0, floorLevels.count - 1)
+                runAnalysis()
+            }
+        }
         .sheet(isPresented: $showTemplates) { templateSheet }
         .sheet(isPresented: $showLoadSheet) { loadSheet }
     }
@@ -233,9 +257,13 @@ struct TrussEditorView: View {
             .padding(.horizontal, 4)
 
             Button {
-                nodes = []; members = []; loads = []
-                results = [:]; selectedNodeID = nil
-                diagram.save(nodes: []); diagram.save(members: []); diagram.save(loads: [])
+                // Keep the built-in floor; only clear user-drawn content
+                nodes   = nodes.filter(\.isFloor)
+                members = members.filter(\.isFloor)
+                loads   = []
+                results = [:]
+                selectedNodeID = nil
+                save()
             } label: {
                 Image(systemName: "trash")
                     .font(.system(size: 12))
@@ -270,50 +298,106 @@ struct TrussEditorView: View {
     // MARK: - Car panel
 
     private var carPanel: some View {
-        HStack(spacing: 12) {
-            HStack(spacing: 4) {
-                Text("Weight:")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                TextField("kN", value: $diagram.carWeight, format: .number)
-                    .keyboardType(.decimalPad)
-                    .font(.caption)
-                    .frame(width: 50)
-                    .textFieldStyle(.roundedBorder)
-                Text("kN")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            // Floor picker — only for template trusses (no built-in floor) with multiple chords
+            let hasBuiltInFloor = nodes.contains(where: \.isFloor)
+            let levels = floorLevels
+            if !hasBuiltInFloor && levels.count > 1 {
+                HStack(spacing: 8) {
+                    Label("Deck", systemImage: "road.lanes")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Picker("", selection: $carFloorLevel) {
+                        ForEach(levels.indices, id: \.self) { i in
+                            Text(floorLevelLabel(i, count: levels.count)).tag(i)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: carFloorLevel) { _, _ in runAnalysis() }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
             }
-            Spacer()
-            Button(carAnimating ? "Stop" : "Simulate") {
-                if carAnimating { carAnimating = false } else { carAnimating = true }
+
+            HStack(spacing: 12) {
+                HStack(spacing: 4) {
+                    Text("Weight:")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField("kN", value: $diagram.carWeight, format: .number)
+                        .keyboardType(.decimalPad)
+                        .font(.caption)
+                        .frame(width: 50)
+                        .textFieldStyle(.roundedBorder)
+                    Text("kN")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button(carAnimating ? "Stop" : "Simulate") {
+                    if carAnimating { carAnimating = false } else { carAnimating = true }
+                }
+                .font(.caption.weight(.semibold))
+                .buttonStyle(.bordered)
             }
-            .font(.caption.weight(.semibold))
-            .buttonStyle(.bordered)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
         .background(.bar)
+    }
+
+    private func floorLevelLabel(_ index: Int, count: Int) -> String {
+        switch count {
+        case 2:  return index == 0 ? "Top" : "Bottom"
+        default:
+            if index == 0            { return "Top" }
+            if index == count - 1    { return "Bottom" }
+            return "Mid \(index)"
+        }
     }
 
     // MARK: - Node circle
 
     private func nodeCircle(_ n: TrussNode) -> some View {
         let isSelected = selectedNodeID == n.id
-        let hasLoad = loads.contains { $0.nodeID == n.id }
-        let col: Color = isSelected ? .accentColor : (hasLoad ? .orange : Color(white: 0.72))
-        return Circle()
+        let hasLoad    = loads.contains { $0.nodeID == n.id }
+        let col: Color = isSelected ? .accentColor
+                       : hasLoad    ? .orange
+                       : n.isFloor  ? Color(white: 0.56)   // concrete-grey road node
+                                    : Color(white: 0.72)
+        let size: CGFloat = n.isFloor ? 14 : 16
+        return RoundedRectangle(cornerRadius: n.isFloor ? 3 : 8)  // square for floor, circle for user
             .fill(col)
-            .frame(width: 16, height: 16)
-            .overlay(Circle().strokeBorder(isSelected ? Color.accentColor : Color(white: 0.5), lineWidth: 1.5))
+            .frame(width: size, height: size)
+            .overlay(
+                RoundedRectangle(cornerRadius: n.isFloor ? 3 : 8)
+                    .strokeBorder(isSelected ? Color.accentColor : Color(white: n.isFloor ? 0.4 : 0.5),
+                                  lineWidth: 1.5)
+            )
             .allowsHitTesting(false)   // all taps handled by background gesture via snapNode
     }
 
     // MARK: - Canvas drawing
 
     private func drawAll(_ ctx: GraphicsContext) {
-        // Members
-        for m in members {
+        // ── Floor beam (road surface) — drawn first so it appears behind members ──
+        for m in members where m.isFloor {
+            guard let sn = nodeByID(m.startID), let en = nodeByID(m.endID) else { continue }
+            var p = Path(); p.move(to: pt(sn)); p.addLine(to: pt(en))
+            // Thick concrete-grey slab
+            ctx.stroke(p, with: .color(Color(white: 0.32)),
+                       style: StrokeStyle(lineWidth: 10, lineCap: .square))
+            // Road-surface highlight line
+            ctx.stroke(p, with: .color(Color(white: 0.5)),
+                       style: StrokeStyle(lineWidth: 2, lineCap: .square))
+            // Dashed centre line (lane markings)
+            ctx.stroke(p, with: .color(Color.white.opacity(0.4)),
+                       style: StrokeStyle(lineWidth: 1.5, lineCap: .butt, dash: [8, 5]))
+        }
+
+        // ── User-drawn members ──
+        for m in members where !m.isFloor {
             guard let sn = nodeByID(m.startID), let en = nodeByID(m.endID) else { continue }
             let res = results[m.id]
             let col: Color = res.map { $0.isBroken ? Color(red: 1, green: 0.1, blue: 0.1) : $0.color }
@@ -480,8 +564,9 @@ struct TrussEditorView: View {
             }
             showLoadSheet = true
         case .erase:
+            guard !n.isFloor else { return }   // built-in floor nodes are permanent
             nodes.removeAll { $0.id == n.id }
-            members.removeAll { $0.startID == n.id || $0.endID == n.id }
+            members.removeAll { (!$0.isFloor) && ($0.startID == n.id || $0.endID == n.id) }
             loads.removeAll { $0.nodeID == n.id }
             if selectedNodeID == n.id { selectedNodeID = nil }
             save()
@@ -508,6 +593,7 @@ struct TrussEditorView: View {
             if d < threshold { closest = (m.id, d) }
         }
         if let (id, _) = closest {
+            guard let m = members.first(where: { $0.id == id }), !m.isFloor else { return }
             members.removeAll { $0.id == id }
             results.removeValue(forKey: id)
             save()
@@ -526,7 +612,18 @@ struct TrussEditorView: View {
     // MARK: - Analysis
 
     private func runAnalysis() {
-        results = analyzeTruss()
+        let r = analyzeTruss()
+        results = r
+        if members.isEmpty {
+            analysisMessage = nil
+        } else if r.isEmpty {
+            let hasSupport = nodes.contains { $0.isPin || $0.isRoller }
+            analysisMessage = hasSupport
+                ? "Truss may be underconstrained — check supports and member connectivity"
+                : "Add a pin or roller support, then tap Analyze"
+        } else {
+            analysisMessage = nil
+        }
     }
 
     private func analyzeTruss() -> [UUID: MemberResult] {
@@ -618,12 +715,41 @@ struct TrussEditorView: View {
         return all
     }
 
+    /// Distinct Y-levels detected in the truss, sorted top-to-bottom (small → large Y).
+    /// Nodes within 8% of canvas height of each other are grouped into one level.
+    private var floorLevels: [Double] {
+        guard !nodes.isEmpty else { return [] }
+        let threshold = max(30.0, canvasSize.height * 0.08)
+        var levels: [Double] = []
+        for y in nodes.map(\.y).sorted() {
+            if levels.isEmpty || abs(y - levels.last!) > threshold {
+                levels.append(y)
+            }
+        }
+        return levels
+    }
+
     private var carNode: TrussNode? {
-        let bottom = nodes.filter { $0.y > canvasSize.height * 0.5 }.sorted { $0.x < $1.x }
-        guard !bottom.isEmpty else { return nil }
-        let minX = bottom.first!.x, maxX = bottom.last!.x
+        // Prefer built-in floor nodes (the designated road surface)
+        let floorNds = nodes.filter(\.isFloor).sorted { $0.x < $1.x }
+        if !floorNds.isEmpty {
+            let minX = floorNds.first!.x, maxX = floorNds.last!.x
+            guard maxX > minX else { return floorNds.first }
+            let targetX = minX + carPosition * (maxX - minX)
+            return floorNds.min(by: { abs($0.x - targetX) < abs($1.x - targetX) })
+        }
+        // Fallback: level-based detection for template trusses (no built-in floor)
+        let levels = floorLevels
+        guard !levels.isEmpty else { return nil }
+        let idx = min(max(carFloorLevel, 0), levels.count - 1)
+        let targetY = levels[idx]
+        let threshold = max(30.0, canvasSize.height * 0.08)
+        let levelNodes = nodes.filter { abs($0.y - targetY) < threshold }.sorted { $0.x < $1.x }
+        guard !levelNodes.isEmpty else { return nil }
+        let minX = levelNodes.first!.x, maxX = levelNodes.last!.x
+        guard maxX > minX else { return levelNodes.first }
         let targetX = minX + carPosition * (maxX - minX)
-        return bottom.min(by: { abs($0.x - targetX) < abs($1.x - targetX) })
+        return levelNodes.min(by: { abs($0.x - targetX) < abs($1.x - targetX) })
     }
 
     private func buildBreakMessage() {
@@ -692,6 +818,7 @@ struct TrussEditorView: View {
 
     private func applyTemplate(_ t: TrussTemplate) {
         let (n, m) = buildTemplate(t)
+        // Templates provide their own bottom chord — no built-in floor needed
         nodes = n; members = m; loads = []
         results = [:]; selectedNodeID = nil
         save()
@@ -803,6 +930,42 @@ struct TrussEditorView: View {
         loads.append(TrussLoad(nodeID: nid, fy: fy, fx: fx,
                                label: loadLabelText.isEmpty ? "P" : loadLabelText))
         save(); showLoadSheet = false
+    }
+
+    // MARK: - Built-in floor injection
+
+    /// Adds a permanent road-surface beam across the bottom of the canvas the
+    /// first time a custom diagram is opened (or after the user clears it).
+    /// Template trusses deliberately skip this because their bottom chord is the road.
+    private func injectFloorIfNeeded() {
+        guard canvasSize.width > 0, canvasSize.height > 0,
+              !nodes.contains(where: \.isFloor) else { return }
+
+        let nFloor = 9
+        let yFloor = canvasSize.height * 0.78
+        let xStart = canvasSize.width  * 0.05
+        let xEnd   = canvasSize.width  * 0.95
+        let dx     = (xEnd - xStart) / Double(nFloor - 1)
+
+        var fNodes: [TrussNode] = []
+        for i in 0..<nFloor {
+            var n = TrussNode(x: xStart + Double(i) * dx, y: yFloor)
+            n.isFloor  = true
+            n.isPin    = (i == 0)
+            n.isRoller = (i == nFloor - 1)
+            fNodes.append(n)
+        }
+
+        var fMembers: [TrussMember] = []
+        for i in 0..<(nFloor - 1) {
+            var m = TrussMember(startID: fNodes[i].id, endID: fNodes[i + 1].id)
+            m.isFloor = true
+            fMembers.append(m)
+        }
+
+        nodes.append(contentsOf: fNodes)
+        members.append(contentsOf: fMembers)
+        save()
     }
 
     // MARK: - Helpers

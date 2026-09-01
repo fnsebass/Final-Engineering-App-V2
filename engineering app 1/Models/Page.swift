@@ -23,6 +23,10 @@ final class Page {
     /// relationship declared on `Notepad.pages`.
     var notepad: Notepad?
 
+    /// Photos placed on this page (position, size, rotation stored per photo).
+    @Relationship(deleteRule: .cascade, inverse: \CanvasPhoto.page)
+    var photos: [CanvasPhoto] = []
+
     init(pageIndex: Int, drawingData: Data = Data()) {
         self.pageIndex = pageIndex
         self.drawingData = drawingData

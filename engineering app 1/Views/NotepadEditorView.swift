@@ -61,6 +61,19 @@ struct NotepadEditorView: View {
     // Long-press color-picker state
     @State private var longPressedPencilIndex: Int? = nil
     @State private var pickerColor: Color = .black
+
+    // Calculator popup
+    @State private var showCalculator = false
+
+    // Box-to-Verify mode (Gemini Vision)
+    @State private var isVerifyMode = false
+
+    // Shape tool
+    @State private var activeShapeKind: ShapeKind = .rectangle
+    @State private var showShapePicker = false
+
+    // Photo import (trigger passed down to CanvasWorkspace)
+    @State private var showPhotoPicker = false
     #endif
 
     var body: some View {
@@ -123,7 +136,10 @@ struct NotepadEditorView: View {
             notepad: notepad,
             activeTool: $activeTool,
             penColor: $penColor,
-            rulerActive: $rulerActive
+            rulerActive: $rulerActive,
+            isVerifyMode: $isVerifyMode,
+            showPhotoPicker: $showPhotoPicker,
+            activeShapeKind: activeShapeKind
         )
         #else
         ContentUnavailableView {
@@ -197,6 +213,8 @@ struct NotepadEditorView: View {
                     let isDrawingMode = activeTool == .pen
                         || activeTool == .straightLine
                         || activeTool == .marker
+                        || activeTool == .highlighter
+                        || activeTool == .shape
                     let isSel = isDrawingMode && selectedColorTag == i
 
                     PencilTipView(tipColor: pencilColor(at: i), isSelected: isSel)
@@ -224,14 +242,59 @@ struct NotepadEditorView: View {
             rowDivider
 
             // ── Drawing tools ─────────────────────────────────
+            toolBtn(icon: "highlighter",   tool: .highlighter)
             toolBtn(icon: "line.diagonal", tool: .straightLine)
             toolBtn(icon: "lasso",         tool: .lasso)
             toolBtn(icon: "eraser",        tool: .eraser)
 
             rowDivider
 
+            // ── Shape tool ────────────────────────────────────
+            shapeBtn
+
+            // ── Photo import ──────────────────────────────────
+            Button { showPhotoPicker = true } label: {
+                Image(systemName: "photo.badge.plus")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(Color.secondary)
+                    .frame(width: 32, height: 32)
+            }
+            .buttonStyle(.plain)
+
+            rowDivider
+
             // ── Ruler toggle ──────────────────────────────────
             rulerBtn
+
+            rowDivider
+
+            // Calculator
+            Button { showCalculator.toggle() } label: {
+                Image(systemName: "sum")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(showCalculator ? Color.accentColor : Color.secondary)
+                    .frame(width: 32, height: 32)
+                    .background(showCalculator ? Color.accentColor.opacity(0.15) : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 7))
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: $showCalculator) {
+                ScientificCalculatorView()
+                    .presentationCompactAdaptation(.popover)
+            }
+
+            rowDivider
+
+            // ── Verify (Box-to-Verify / Gemini Vision) ───────────────
+            Button { isVerifyMode.toggle() } label: {
+                Image(systemName: "viewfinder.rectangular")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(isVerifyMode ? Color.accentColor : Color.secondary)
+                    .frame(width: 32, height: 32)
+                    .background(isVerifyMode ? Color.accentColor.opacity(0.15) : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 7))
+            }
+            .buttonStyle(.plain)
 
             rowDivider
 
@@ -346,6 +409,33 @@ struct NotepadEditorView: View {
         }
         .buttonStyle(.plain)
     }
+
+    private var shapeBtn: some View {
+        let sel = activeTool == .shape
+        return Button {
+            if sel {
+                activeTool = .pen
+            } else {
+                showShapePicker = true
+            }
+        } label: {
+            Image(systemName: activeShapeKind.systemImage)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(sel ? Color.accentColor : Color.secondary)
+                .frame(width: 32, height: 32)
+                .background(sel ? Color.accentColor.opacity(0.15) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 7))
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $showShapePicker) {
+            ShapePickerPopover(activeKind: $activeShapeKind) { kind in
+                activeShapeKind = kind
+                activeTool = .shape
+                showShapePicker = false
+            }
+            .presentationCompactAdaptation(.popover)
+        }
+    }
     #endif
 }
 
@@ -412,6 +502,35 @@ private struct TriangleTipMask: Shape {
             p.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
             p.closeSubpath()
         }
+    }
+}
+
+private struct ShapePickerPopover: View {
+    @Binding var activeKind: ShapeKind
+    let onSelect: (ShapeKind) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Shape")
+                .font(.headline)
+                .padding(.bottom, 4)
+            ForEach(ShapeKind.allCases, id: \.self) { kind in
+                Button { onSelect(kind) } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: kind.systemImage)
+                            .frame(width: 22, alignment: .center)
+                        Text(kind.displayName)
+                    }
+                    .foregroundStyle(activeKind == kind ? Color.accentColor : Color.primary)
+                    .padding(.vertical, 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding()
+        .frame(minWidth: 170)
     }
 }
 #endif

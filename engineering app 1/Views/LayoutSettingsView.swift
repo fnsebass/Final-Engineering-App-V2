@@ -14,6 +14,7 @@ enum LayoutPrefs {
     static let foldersFirst = "layout.foldersFirst"
     static let accentRaw = "layout.accent"
     static let defaultPaperStyle = "layout.defaultPaperStyle"
+    static let aiVerbose = "ai.verbose"
 }
 
 enum LayoutAccent: String, CaseIterable, Identifiable {
@@ -37,6 +38,10 @@ struct LayoutSettingsView: View {
     @AppStorage(LayoutPrefs.showDates) private var showDates = true
     @AppStorage(LayoutPrefs.accentRaw) private var accentRaw = LayoutAccent.blue.rawValue
     @AppStorage(LayoutPrefs.defaultPaperStyle) private var defaultPaperStyleRaw = PaperStyle.grid.rawValue
+    @AppStorage(LayoutPrefs.aiVerbose) private var aiVerbose = true
+
+    // Gemini API key — stored in UserDefaults (same key GeminiVisionService reads).
+    @State private var geminiKey: String = GeminiVisionService.apiKey
 
     var body: some View {
         NavigationStack {
@@ -55,6 +60,39 @@ struct LayoutSettingsView: View {
                 // MARK: - Display Settings
                 Section("Card Display") {
                     Toggle("Show edited dates on cards", isOn: $showDates)
+                }
+
+                // MARK: - Gemini Vision API Key
+                Section {
+                    SecureField("Paste API key here", text: $geminiKey)
+                        .textContentType(.password)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .onChange(of: geminiKey) { _, newKey in
+                            GeminiVisionService.apiKey = newKey
+                        }
+                    if geminiKey.isEmpty {
+                        Label("Key required for Box Verify mode", systemImage: "key.slash")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    } else {
+                        Label("Key saved", systemImage: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    }
+                } header: {
+                    Text("Gemini Vision API Key")
+                } footer: {
+                    Text("Used by the Box-to-Verify feature. Get a free key at aistudio.google.com. Stored locally on device.")
+                        .font(.caption)
+                }
+
+                // MARK: - AI Response Style
+                Section("On-Device AI Response Style") {
+                    Toggle("Full explanations", isOn: $aiVerbose)
+                    Text("When off, the on-device AI gives a brief answer check instead of a full step-by-step walkthrough.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 // MARK: - Accent Color Selection

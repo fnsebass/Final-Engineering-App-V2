@@ -272,7 +272,9 @@ struct OnDeviceEquationReviewService: EquationReviewService {
     OPERATORS: "<=" = ≤, ">=" = ≥, "!=" = ≠, "->" = →.
 
     Infer the most plausible mathematical expression from context and solve it. \
-    Reply under 100 words, plain text. State your interpretation if ambiguous, \
+    Reply under 100 words. Use plain text only — no markdown, no asterisks, \
+    no bullet symbols, no dollar signs or backslash-bracket LaTeX notation. \
+    Use Unicode math symbols directly (∫ √ × → ≤ ∞ ∂). State your interpretation if ambiguous, \
     then proceed. Flag any error with the specific mistake and correction. \
     Never refuse — always give your best mathematical answer.
     """
@@ -385,10 +387,13 @@ struct OnDeviceEquationReviewService: EquationReviewService {
 
     Identify the problem (state your interpretation of any ambiguous OCR), \
     then explain step-by-step HOW to solve it — teach the method so the \
-    student can handle similar problems. Number each step. Under 200 words, \
-    plain text. Cover integration techniques (parts, substitution, partial \
-    fractions), derivatives (chain/product/quotient/implicit), limits, \
-    differential equations, and engineering calculations. \
+    student can handle similar problems. Number each step. Under 200 words. \
+    Use plain text only — no markdown, no asterisks for bold or italic, \
+    no bullet symbols, no dollar signs or backslash-bracket LaTeX notation. \
+    Use Unicode math symbols directly (∫ √ × → ≤ ∞ ∂ ²). Cover integration techniques \
+    (parts, substitution, partial fractions), derivatives \
+    (chain/product/quotient/implicit), limits, differential equations, and \
+    engineering calculations. \
     If truly uninterpretable, describe what you see and ask what's needed.
     """
 
@@ -420,15 +425,16 @@ struct OnDeviceEquationReviewService: EquationReviewService {
         if let reason = availabilityReason() {
             return AIReviewResult(state: .modelUnavailable(reason: reason), reviewText: nil)
         }
-        return await Task.detached(priority: .userInitiated) {
-            do {
+        do {
+            let raw = try await Task.detached(priority: .userInitiated) {
                 let session = LanguageModelSession(instructions: reviewInstructions)
                 let response = try await session.respond(to: ocrPrompt("Equation", trimmed))
-                return AIReviewResult(state: .reviewed, reviewText: response.content)
-            } catch {
-                return AIReviewResult(state: .failed(reason: error.localizedDescription), reviewText: nil)
-            }
-        }.value
+                return response.content
+            }.value
+            return AIReviewResult(state: .reviewed, reviewText: AITextSanitizer.run(raw))
+        } catch {
+            return AIReviewResult(state: .failed(reason: error.localizedDescription), reviewText: nil)
+        }
     }
 
     func reviewSteps(problem: String) async -> StepReviewResult {
@@ -438,22 +444,22 @@ struct OnDeviceEquationReviewService: EquationReviewService {
         if let reason = availabilityReason() {
             return StepReviewResult(state: .modelUnavailable(reason: reason), steps: [], verdict: nil)
         }
-        return await Task.detached(priority: .userInitiated) {
-            do {
+        do {
+            let content = try await Task.detached(priority: .userInitiated) {
                 let session = LanguageModelSession(instructions: stepInstructions)
                 let response = try await session.respond(
                     to: ocrPrompt("Work to review", trimmed),
                     generating: GeneratedStepReview.self
                 )
-                let content = response.content
-                let steps = content.steps.map {
-                    ReviewedStep(text: $0.text, isCorrect: $0.isCorrect, note: $0.note)
-                }
-                return StepReviewResult(state: .reviewed, steps: steps, verdict: content.verdict)
-            } catch {
-                return StepReviewResult(state: .failed(reason: error.localizedDescription), steps: [], verdict: nil)
+                return response.content
+            }.value
+            let steps = content.steps.map {
+                ReviewedStep(text: $0.text, isCorrect: $0.isCorrect, note: AITextSanitizer.run($0.note))
             }
-        }.value
+            return StepReviewResult(state: .reviewed, steps: steps, verdict: AITextSanitizer.run(content.verdict))
+        } catch {
+            return StepReviewResult(state: .failed(reason: error.localizedDescription), steps: [], verdict: nil)
+        }
     }
 
     func explain(problem: String) async -> AIReviewResult {
@@ -463,15 +469,16 @@ struct OnDeviceEquationReviewService: EquationReviewService {
         if let reason = availabilityReason() {
             return AIReviewResult(state: .modelUnavailable(reason: reason), reviewText: nil)
         }
-        return await Task.detached(priority: .userInitiated) {
-            do {
+        do {
+            let raw = try await Task.detached(priority: .userInitiated) {
                 let session = LanguageModelSession(instructions: explainInstructions)
                 let response = try await session.respond(to: ocrPrompt("Problem", trimmed))
-                return AIReviewResult(state: .reviewed, reviewText: response.content)
-            } catch {
-                return AIReviewResult(state: .failed(reason: error.localizedDescription), reviewText: nil)
-            }
-        }.value
+                return response.content
+            }.value
+            return AIReviewResult(state: .reviewed, reviewText: AITextSanitizer.run(raw))
+        } catch {
+            return AIReviewResult(state: .failed(reason: error.localizedDescription), reviewText: nil)
+        }
     }
 
     func checkAlgebra(problem: String) async -> AlgebraicCheckResult {
@@ -481,27 +488,29 @@ struct OnDeviceEquationReviewService: EquationReviewService {
         if let reason = availabilityReason() {
             return AlgebraicCheckResult(state: .modelUnavailable(reason: reason), verdict: nil, errors: [])
         }
-        return await Task.detached(priority: .userInitiated) {
-            do {
+        do {
+            let c = try await Task.detached(priority: .userInitiated) {
                 let session = LanguageModelSession(instructions: algebraCheckInstructions)
                 let response = try await session.respond(
                     to: ocrPrompt("Math work to check", trimmed),
                     generating: GeneratedAlgebraicCheck.self
                 )
-                let c = response.content
-                let errors = c.errors.map { e in
-                    MathError(expression: e.expression, errorType: e.errorType,
-                              reason: e.reason, correction: e.correction)
-                }
-                let state: AlgebraicCheckResult.State =
-                    c.verdict.lowercased().contains("error") || !errors.isEmpty
-                    ? .hasErrors : .correct
-                return AlgebraicCheckResult(state: state, verdict: c.verdict, errors: errors)
-            } catch {
-                return AlgebraicCheckResult(state: .failed(reason: error.localizedDescription),
-                                            verdict: nil, errors: [])
+                return response.content
+            }.value
+            let errors = c.errors.map { e in
+                MathError(expression: e.expression,
+                          errorType: AITextSanitizer.run(e.errorType),
+                          reason: AITextSanitizer.run(e.reason),
+                          correction: AITextSanitizer.run(e.correction))
             }
-        }.value
+            let verdict = AITextSanitizer.run(c.verdict)
+            let state: AlgebraicCheckResult.State =
+                verdict.lowercased().contains("error") || !errors.isEmpty
+                ? .hasErrors : .correct
+            return AlgebraicCheckResult(state: state, verdict: verdict, errors: errors)
+        } catch {
+            return AlgebraicCheckResult(state: .failed(reason: error.localizedDescription), verdict: nil, errors: [])
+        }
     }
 
     func analyzeChemistry(problem: String) async -> ChemistryResult {
@@ -513,23 +522,26 @@ struct OnDeviceEquationReviewService: EquationReviewService {
             return ChemistryResult(state: .modelUnavailable(reason: reason),
                                    result: nil, analysisType: nil, findings: [])
         }
-        return await Task.detached(priority: .userInitiated) {
-            do {
+        do {
+            let c = try await Task.detached(priority: .userInitiated) {
                 let session = LanguageModelSession(instructions: chemistryInstructions)
                 let response = try await session.respond(
                     to: ocrPrompt("Chemistry problem", trimmed),
                     generating: GeneratedChemistryAnalysis.self
                 )
-                let c = response.content
-                return ChemistryResult(state: .reviewed,
-                                       result: c.result.isEmpty ? nil : c.result,
-                                       analysisType: c.analysisType.isEmpty ? nil : c.analysisType,
-                                       findings: c.findings)
-            } catch {
-                return ChemistryResult(state: .failed(reason: error.localizedDescription),
-                                       result: nil, analysisType: nil, findings: [])
-            }
-        }.value
+                return response.content
+            }.value
+            let cleanResult   = AITextSanitizer.run(c.result)
+            let cleanType     = AITextSanitizer.run(c.analysisType)
+            let cleanFindings = c.findings.map { AITextSanitizer.run($0) }
+            return ChemistryResult(state: .reviewed,
+                                   result: cleanResult.isEmpty ? nil : cleanResult,
+                                   analysisType: cleanType.isEmpty ? nil : cleanType,
+                                   findings: cleanFindings)
+        } catch {
+            return ChemistryResult(state: .failed(reason: error.localizedDescription),
+                                   result: nil, analysisType: nil, findings: [])
+        }
     }
 
     func extractGraphExpression(from rawOCR: String) async -> String? {

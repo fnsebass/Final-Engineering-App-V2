@@ -25,6 +25,11 @@ struct EquationGraphView: View {
     let expression: String        // initial expression from OCR (seed value)
     @Binding var isPresented: Bool
 
+    // Floating-card callbacks (nil = card is embedded/pinned, not floating)
+    let onHeaderDrag:    ((CGSize) -> Void)?
+    let onTopLeftResize: ((CGSize) -> Void)?
+    let onPin:           (() -> Void)?
+
     @State private var editExpr: String
     @FocusState private var fieldFocused: Bool
 
@@ -39,14 +44,39 @@ struct EquationGraphView: View {
     // 2-D draw-in animation (0 = hidden, 1 = fully revealed)
     @State private var chartReveal: CGFloat = 0
 
-    init(equationText: String, expression: String, isPresented: Binding<Bool>) {
-        self.equationText = equationText
-        self.expression = expression
-        self._isPresented = isPresented
-        self._editExpr = State(initialValue: expression)
+    // Graph dimension override
+    private enum GraphDimension: Equatable { case auto, force2D, force3D }
+    @State private var modeOverride: GraphDimension
+
+    // Drag delta tracking (DragGesture gives cumulative translation; we send incremental deltas)
+    @State private var prevHeaderDrag: CGSize = .zero
+    @State private var prevResizeDrag: CGSize = .zero
+
+    init(equationText: String, expression: String, forceIs3D: Bool? = nil, isPresented: Binding<Bool>,
+         onHeaderDrag:    ((CGSize) -> Void)? = nil,
+         onTopLeftResize: ((CGSize) -> Void)? = nil,
+         onPin:           (() -> Void)? = nil) {
+        self.equationText    = equationText
+        self.expression      = expression
+        self._isPresented    = isPresented
+        self._editExpr       = State(initialValue: expression)
+        self.onHeaderDrag    = onHeaderDrag
+        self.onTopLeftResize = onTopLeftResize
+        self.onPin           = onPin
+        switch forceIs3D {
+        case .some(true):  self._modeOverride = State(initialValue: .force3D)
+        case .some(false): self._modeOverride = State(initialValue: .force2D)
+        case .none:        self._modeOverride = State(initialValue: .auto)
+        }
     }
 
-    private var is3D: Bool { MathEvaluator.is3DExpression(editExpr) }
+    private var is3D: Bool {
+        switch modeOverride {
+        case .auto:    return MathEvaluator.is3DExpression(editExpr)
+        case .force2D: return false
+        case .force3D: return true
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -57,7 +87,8 @@ struct EquationGraphView: View {
                 emptyPrompt
             } else if is3D {
                 Graph3DScene(expression: editExpr, range: axisRange)
-                    .frame(height: 360)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minHeight: 260)
                 Divider()
                 controls3D
                 hint3D
@@ -67,11 +98,52 @@ struct EquationGraphView: View {
                 controls2D
             }
         }
-        .frame(height: is3D ? nil : (editExpr.isEmpty ? 220 : graphHeight))
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 20))
         .overlay(RoundedRectangle(cornerRadius: 20).strokeBorder(.blue.opacity(0.35), lineWidth: 1))
         .shadow(radius: 18, y: 6)
+        .overlay(alignment: .topLeading) {
+            if onTopLeftResize != nil { resizeHandle }
+        }
+    }
+
+    // MARK: - Resize handle (Apple-style L-shaped corner lines)
+
+    private var resizeHandle: some View {
+        ZStack(alignment: .topLeading) {
+            // Transparent hit area
+            Color.clear
+                .frame(width: 36, height: 36)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture()
+                        .onChanged { v in
+                            let delta = CGSize(
+                                width:  v.translation.width  - prevResizeDrag.width,
+                                height: v.translation.height - prevResizeDrag.height
+                            )
+                            prevResizeDrag = v.translation
+                            onTopLeftResize?(delta)
+                        }
+                        .onEnded { _ in prevResizeDrag = .zero }
+                )
+
+            // Visual: two L-shaped lines inset from the corner
+            Canvas { ctx, _ in
+                let len: CGFloat = 12, t: CGFloat = 2, inset: CGFloat = 8
+                for offset in stride(from: CGFloat(0), through: 4, by: 4) {
+                    let x = inset + offset, y = inset + offset
+                    var h = Path()
+                    h.move(to: CGPoint(x: x, y: y + len))
+                    h.addLine(to: CGPoint(x: x, y: y))
+                    h.addLine(to: CGPoint(x: x + len, y: y))
+                    ctx.stroke(h, with: .color(.secondary.opacity(0.6 - offset * 0.1)),
+                               style: StrokeStyle(lineWidth: t, lineCap: .round, lineJoin: .round))
+                }
+            }
+            .frame(width: 36, height: 36)
+            .allowsHitTesting(false)
+        }
     }
 
     // MARK: - Header
@@ -81,7 +153,7 @@ struct EquationGraphView: View {
             Image(systemName: is3D ? "cube" : "waveform.path.ecg")
                 .foregroundStyle(.blue)
             VStack(alignment: .leading, spacing: 2) {
-                Text(is3D ? "3-D Graph" : "Graph")
+                Text(is3D ? "3-D Graph" : "2-D Graph")
                     .font(.subheadline.weight(.semibold))
                 Text(equationText.isEmpty ? "Edit the expression below" : equationText)
                     .font(.caption2)
@@ -89,6 +161,22 @@ struct EquationGraphView: View {
                     .lineLimit(1)
             }
             Spacer()
+            Picker("", selection: $modeOverride) {
+                Text("2-D").tag(GraphDimension.force2D)
+                Text("3-D").tag(GraphDimension.force3D)
+                Text("Auto").tag(GraphDimension.auto)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 120)
+            // Pin button — only shown for floating cards
+            if onPin != nil {
+                Button { onPin?() } label: {
+                    Image(systemName: "pin.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
             Button {
                 withAnimation(.spring(response: 0.3)) { isPresented = false }
             } label: {
@@ -100,6 +188,20 @@ struct EquationGraphView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
+        // Drag gesture for moving the floating card (no-op when embedded without callback)
+        .gesture(
+            DragGesture()
+                .onChanged { v in
+                    guard onHeaderDrag != nil else { return }
+                    let delta = CGSize(
+                        width:  v.translation.width  - prevHeaderDrag.width,
+                        height: v.translation.height - prevHeaderDrag.height
+                    )
+                    prevHeaderDrag = v.translation
+                    onHeaderDrag?(delta)
+                }
+                .onEnded { _ in prevHeaderDrag = .zero }
+        )
     }
 
     // MARK: - Expression editor row
@@ -194,6 +296,7 @@ struct EquationGraphView: View {
                     AxisValueLabel()
                 }
             }
+            .frame(height: graphHeight)
             .padding(12)
             .mask {
                 GeometryReader { geo in

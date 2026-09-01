@@ -35,6 +35,7 @@ struct PencilCanvasView: UIViewRepresentable {
     @Binding var activeTool: DrawingTool
     @Binding var penColor: Color
     let penWidth: Double
+    let activeShapeKind: ShapeKind
 
     /// True when the paper background is dark (luminance < 0.5).
     private var isDarkPaper: Bool {
@@ -132,6 +133,12 @@ struct PencilCanvasView: UIViewRepresentable {
         context.coordinator.onLongPressPreviewEnd = onLongPressPreviewEnd
         context.coordinator.onLongPress           = onLongPress
 
+        // Wire shape overlay commit callback — reads current shapeKind from overlay at commit time.
+        context.coordinator.shapeOverlay = wrapper.shapeOverlay
+        wrapper.shapeOverlay.onCommit = { [weak coord] start, end in
+            coord?.commitShape(from: start, to: end)
+        }
+
         // Apple Pencil interaction (double-tap + Pencil Pro squeeze)
         let pencilInteraction = UIPencilInteraction()
         pencilInteraction.delegate = context.coordinator
@@ -142,8 +149,9 @@ struct PencilCanvasView: UIViewRepresentable {
 
     func updateUIView(_ wrapper: CanvasWrapper, context: Context) {
         let canvas = wrapper.canvas
-        let coord  = context.coordinator
-        let overlay = wrapper.straightLineOverlay
+        let coord       = context.coordinator
+        let overlay     = wrapper.straightLineOverlay
+        let shapeOvr    = wrapper.shapeOverlay
 
         coord.isDarkPaper           = isDarkPaper
         coord.onLongPressPreview    = onLongPressPreview
@@ -155,13 +163,12 @@ struct PencilCanvasView: UIViewRepresentable {
         let paper = PaperTheme.uiColor(fromHex: paperColorHex)
         wrapper.gridView.setup(style: paperStyle, columns: gridColumns, paper: paper)
 
-        // Store current ink properties so the coordinator can commit straight lines.
+        // Store current ink properties so the coordinator can commit straight lines and shapes.
         let inkColor = inkUIColor(from: penColor)
         coord.currentInkColor = inkColor
         coord.currentPenWidth = CGFloat(penWidth)
 
-        // Apply tool to PKCanvasView (used for all non-straight-line tools and
-        // for the long-press OCR ink reference).
+        // Apply tool to PKCanvasView.
         coord.activeTool = activeTool
         applyTool(to: canvas, tool: activeTool, color: inkColor, width: CGFloat(penWidth))
 
@@ -174,12 +181,25 @@ struct PencilCanvasView: UIViewRepresentable {
         } else {
             overlay.deactivate()
         }
+
+        // Activate or deactivate the shape overlay.
+        shapeOvr.inkColor     = inkColor
+        shapeOvr.inkWidth     = CGFloat(penWidth)
+        shapeOvr.scrollOffset = canvas.contentOffset.y
+        shapeOvr.shapeKind    = activeShapeKind
+        if activeTool == .shape {
+            shapeOvr.activate()
+        } else {
+            shapeOvr.deactivate()
+        }
     }
 
     private func applyTool(to canvas: CanvasView, tool: DrawingTool, color: UIColor, width: CGFloat) {
         switch tool {
-        case .pen, .straightLine: canvas.tool = PKInkingTool(.pen,    color: color, width: width)
-        case .marker:             canvas.tool = PKInkingTool(.marker, color: color, width: width * 4)
+        case .pen, .straightLine, .shape:
+                                  canvas.tool = PKInkingTool(.pen,         color: color, width: width)
+        case .marker:             canvas.tool = PKInkingTool(.marker,      color: color, width: width * 4)
+        case .highlighter:        canvas.tool = PKInkingTool(.marker, color: color.withAlphaComponent(0.42), width: width * 8)
         case .eraser:             canvas.tool = PKEraserTool(.vector)
         case .lasso:              canvas.tool = PKLassoTool()
         }
@@ -194,11 +214,13 @@ struct PencilCanvasView: UIViewRepresentable {
         weak var gridView: GridContentView?
         weak var straightLineOverlay: StraightLineOverlay?
 
+        weak var shapeOverlay: ShapeOverlay?
+
         var activeTool: DrawingTool = .pen
         var isDrawing  = false
         private var isResettingCanvas = false
 
-        // Ink state used when building a straight-line PKStroke.
+        // Ink state used when building straight-line and shape PKStrokes.
         var currentInkColor: UIColor = .black
         var currentPenWidth: CGFloat = 3
 
@@ -251,17 +273,12 @@ struct PencilCanvasView: UIViewRepresentable {
         private func captureOCRImage(from drawing: PKDrawing, around center: CGPoint) -> UIImage {
             let region = CGRect(x: center.x - 400, y: center.y - 220, width: 800, height: 440)
 
-            // On a dark paper the ink is light-colored. Render it in its native style
-            // (no trait-collection override) so we preserve the actual ink color,
-            // then composite on a BLACK background so OCR sees dark text on light bg
-            // after we invert. For light paper, the standard white-background path works.
+            // Always render in light mode so PencilKit uses the stored (light-resolved)
+            // ink colors regardless of the system's dark/light setting.
+            // On dark paper the ink is light; we composite on black then invert for OCR.
             var inkImage = UIImage()
-            if isDarkPaper {
+            UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
                 inkImage = drawing.image(from: region, scale: 2)
-            } else {
-                UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
-                    inkImage = drawing.image(from: region, scale: 2)
-                }
             }
 
             let format = UIGraphicsImageRendererFormat.default()
@@ -320,6 +337,95 @@ struct PencilCanvasView: UIViewRepresentable {
             canvas.drawing = drawing
         }
 
+        // MARK: Shape stroke commit
+
+        func commitShape(from start: CGPoint, to end: CGPoint) {
+            guard let canvas = canvas else { return }
+            let kind = shapeOverlay?.shapeKind ?? .rectangle
+            let strokes = shapeStrokes(from: start, to: end, kind: kind)
+            guard !strokes.isEmpty else { return }
+            var drawing = canvas.drawing
+            drawing.strokes.append(contentsOf: strokes)
+            canvas.drawing = drawing
+        }
+
+        private func shapeStrokes(from start: CGPoint, to end: CGPoint, kind: ShapeKind) -> [PKStroke] {
+            let rect = CGRect(
+                x: Swift.min(start.x, end.x),
+                y: Swift.min(start.y, end.y),
+                width: abs(end.x - start.x),
+                height: abs(end.y - start.y)
+            )
+            guard rect.width > 4 || rect.height > 4 else { return [] }
+
+            let ink = PKInk(.pen, color: currentInkColor)
+
+            func mkStroke(_ pts: [CGPoint]) -> PKStroke {
+                let n = pts.count
+                let sPts = pts.enumerated().map { i, p in
+                    PKStrokePoint(
+                        location: p,
+                        timeOffset: Double(i) / Double(Swift.max(n - 1, 1)),
+                        size: CGSize(width: currentPenWidth, height: currentPenWidth),
+                        opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2
+                    )
+                }
+                return PKStroke(ink: ink, path: PKStrokePath(controlPoints: sPts, creationDate: Date()))
+            }
+
+            func lerp(_ a: CGPoint, _ b: CGPoint) -> [CGPoint] {
+                let len = hypot(b.x - a.x, b.y - a.y)
+                let n = Swift.max(3, Int(len / 8) + 2)
+                return (0..<n).map { i in
+                    let t = CGFloat(i) / CGFloat(n - 1)
+                    return CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)
+                }
+            }
+
+            func ellipsePts(in r: CGRect, count: Int = 72) -> [CGPoint] {
+                (0...count).map { i in
+                    let t = 2 * CGFloat.pi * CGFloat(i) / CGFloat(count)
+                    return CGPoint(x: r.midX + r.width / 2 * cos(t),
+                                   y: r.midY + r.height / 2 * sin(t))
+                }
+            }
+
+            switch kind {
+            case .rectangle:
+                let tl = CGPoint(x: rect.minX, y: rect.minY)
+                let tr = CGPoint(x: rect.maxX, y: rect.minY)
+                let br = CGPoint(x: rect.maxX, y: rect.maxY)
+                let bl = CGPoint(x: rect.minX, y: rect.maxY)
+                return [mkStroke(lerp(tl, tr)), mkStroke(lerp(tr, br)),
+                        mkStroke(lerp(br, bl)), mkStroke(lerp(bl, tl))]
+
+            case .circle:
+                let side = Swift.min(rect.width, rect.height)
+                let cr = CGRect(x: rect.midX - side/2, y: rect.midY - side/2, width: side, height: side)
+                return [mkStroke(ellipsePts(in: cr))]
+
+            case .oval:
+                return [mkStroke(ellipsePts(in: rect))]
+
+            case .arrow:
+                let angle = atan2(end.y - start.y, end.x - start.x)
+                let headLen = Swift.max(20, hypot(end.x - start.x, end.y - start.y) * 0.2)
+                let a1 = angle + .pi * 5 / 6
+                let a2 = angle - .pi * 5 / 6
+                let h1 = CGPoint(x: end.x + headLen * cos(a1), y: end.y + headLen * sin(a1))
+                let h2 = CGPoint(x: end.x + headLen * cos(a2), y: end.y + headLen * sin(a2))
+                return [mkStroke(lerp(start, end)),
+                        mkStroke(lerp(end, h1)),
+                        mkStroke(lerp(end, h2))]
+
+            case .triangle:
+                let p1 = CGPoint(x: rect.midX, y: rect.minY)
+                let p2 = CGPoint(x: rect.minX, y: rect.maxY)
+                let p3 = CGPoint(x: rect.maxX, y: rect.maxY)
+                return [mkStroke(lerp(p1, p2)), mkStroke(lerp(p2, p3)), mkStroke(lerp(p3, p1))]
+            }
+        }
+
         // MARK: PKCanvasViewDelegate
 
         func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) { isDrawing = true }
@@ -330,6 +436,7 @@ struct PencilCanvasView: UIViewRepresentable {
             gridView?.scrollOffset = scrollView.contentOffset.y
             gridView?.setNeedsDisplay()
             straightLineOverlay?.scrollOffset = scrollView.contentOffset.y
+            shapeOverlay?.scrollOffset = scrollView.contentOffset.y
 
             guard let canvas = canvas,
                   scrollView.bounds.height > 0,
@@ -405,28 +512,89 @@ struct PencilCanvasView: UIViewRepresentable {
 
 // MARK: - CanvasWrapper
 
-/// Container: GridContentView (z=0) → CanvasView (z=1) → StraightLineOverlay (z=2).
+/// Container: GridContentView (z=0) → CanvasView (z=1) → StraightLineOverlay (z=2) → ShapeOverlay (z=3).
+/// Handles pinch-to-zoom by scaling the entire wrapper (grid + ink scale together).
 final class CanvasWrapper: UIView {
     let canvas: CanvasView
     let gridView: GridContentView
     let straightLineOverlay: StraightLineOverlay
+    let shapeOverlay: ShapeOverlay
+
+    private var zoomScale: CGFloat = 1.0
+    private var zoomTx: CGFloat = 0
+    private var zoomTy: CGFloat = 0
+    private var pinchStartScale: CGFloat = 1.0
+    private var pinchAnchorLocal: CGPoint = .zero   // pinch center in untransformed canvas coords
+    private var pinchAnchorScreen: CGPoint = .zero  // pinch center in superview coords
 
     init() {
         canvas              = CanvasView()
         gridView            = GridContentView()
         straightLineOverlay = StraightLineOverlay()
+        shapeOverlay        = ShapeOverlay()
         super.init(frame: .zero)
         addSubview(gridView)             // z = 0
         addSubview(canvas)               // z = 1
         addSubview(straightLineOverlay)  // z = 2, intercepts pencil touches when active
+        addSubview(shapeOverlay)         // z = 3, intercepts pencil touches for shape drawing
+
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch))
+        addGestureRecognizer(pinch)
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+        guard let sv = superview else { return }
+
+        switch gesture.state {
+        case .began:
+            pinchStartScale   = zoomScale
+            pinchAnchorScreen = gesture.location(in: sv)
+
+            // Invert the current transform to find which untransformed canvas point
+            // sits under the pinch. Formula: local = (screen - center - tx) / scale + bounds.mid
+            pinchAnchorLocal = CGPoint(
+                x: (pinchAnchorScreen.x - center.x - zoomTx) / zoomScale + bounds.midX,
+                y: (pinchAnchorScreen.y - center.y - zoomTy) / zoomScale + bounds.midY
+            )
+
+        case .changed:
+            let s = Swift.min(Swift.max(pinchStartScale * gesture.scale, 1.0), 4.0)
+
+            // Build a scale + translate transform that keeps pinchAnchorLocal
+            // fixed at pinchAnchorScreen regardless of scale.
+            var t = CGAffineTransform.identity
+            if s > 1.0 {
+                t.a  = s;  t.d  = s
+                t.tx = pinchAnchorScreen.x - center.x - s * (pinchAnchorLocal.x - bounds.midX)
+                t.ty = pinchAnchorScreen.y - center.y - s * (pinchAnchorLocal.y - bounds.midY)
+            }
+            // s == 1.0: identity (t already is identity, which resets any translation)
+
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            transform = t
+            CATransaction.commit()
+
+        case .ended, .cancelled:
+            zoomScale = Swift.min(Swift.max(pinchStartScale * gesture.scale, 1.0), 4.0)
+            if zoomScale <= 1.0 {
+                zoomTx = 0; zoomTy = 0
+            } else {
+                zoomTx = transform.tx
+                zoomTy = transform.ty
+            }
+
+        default: break
+        }
+    }
 
     override func layoutSubviews() {
         super.layoutSubviews()
         canvas.frame              = bounds
         gridView.frame            = bounds
         straightLineOverlay.frame = bounds
+        shapeOverlay.frame        = bounds
     }
 }
 
@@ -531,6 +699,134 @@ final class StraightLineOverlay: UIView {
     }
 
     /// Convert overlay view-space point to PKCanvasView content-space point.
+    private func toContent(_ vp: CGPoint) -> CGPoint {
+        CGPoint(x: vp.x, y: vp.y + scrollOffset)
+    }
+}
+
+// MARK: - ShapeOverlay
+
+/// Transparent view (z=3) that intercepts pencil touches when the shape tool is active.
+/// Shows a live CAShapeLayer preview, then calls onCommit(start, end) in content-space
+/// coordinates when the pencil lifts. Finger touches fall through to the canvas.
+final class ShapeOverlay: UIView {
+    var onCommit: ((CGPoint, CGPoint) -> Void)?
+    var inkColor: UIColor = .black { didSet { lineLayer.strokeColor = inkColor.cgColor } }
+    var inkWidth: CGFloat = 3     { didSet { lineLayer.lineWidth = inkWidth } }
+    var scrollOffset: CGFloat = 0
+    var shapeKind: ShapeKind = .rectangle
+
+    private var isCapturing = false
+    private var startPoint: CGPoint?
+    private let lineLayer = CAShapeLayer()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+        lineLayer.fillColor  = UIColor.clear.cgColor
+        lineLayer.lineCap    = .round
+        lineLayer.lineJoin   = .round
+        layer.addSublayer(lineLayer)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func activate() {
+        lineLayer.strokeColor = inkColor.cgColor
+        lineLayer.lineWidth   = inkWidth
+        isCapturing = true
+        isUserInteractionEnabled = true
+    }
+
+    func deactivate() {
+        isCapturing = false
+        isUserInteractionEnabled = false
+        clearPreview()
+        startPoint = nil
+    }
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        guard isCapturing, bounds.contains(point) else { return nil }
+        if let touch = event?.allTouches?.first, touch.type != .pencil { return nil }
+        return self
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let t = touches.first(where: { $0.type == .pencil }) else { return }
+        startPoint = t.location(in: self)
+        updatePreview(from: startPoint!, to: startPoint!)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let t = touches.first(where: { $0.type == .pencil }),
+              let start = startPoint else { return }
+        updatePreview(from: start, to: t.location(in: self))
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let t = touches.first(where: { $0.type == .pencil }),
+              let start = startPoint else {
+            clearPreview(); startPoint = nil; return
+        }
+        let end = t.location(in: self)
+        clearPreview()
+        startPoint = nil
+        onCommit?(toContent(start), toContent(end))
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        clearPreview(); startPoint = nil
+    }
+
+    private func updatePreview(from start: CGPoint, to current: CGPoint) {
+        let path = previewPath(from: start, to: current)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        lineLayer.path = path
+        CATransaction.commit()
+    }
+
+    private func clearPreview() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        lineLayer.path = nil
+        CATransaction.commit()
+    }
+
+    private func previewPath(from start: CGPoint, to end: CGPoint) -> CGPath {
+        let rect = CGRect(
+            x: Swift.min(start.x, end.x), y: Swift.min(start.y, end.y),
+            width: abs(end.x - start.x), height: abs(end.y - start.y)
+        )
+        let path = CGMutablePath()
+        switch shapeKind {
+        case .rectangle:
+            path.addRect(rect)
+        case .circle:
+            let side = Swift.min(rect.width, rect.height)
+            path.addEllipse(in: CGRect(x: rect.midX - side/2, y: rect.midY - side/2,
+                                       width: side, height: side))
+        case .oval:
+            path.addEllipse(in: rect)
+        case .arrow:
+            let angle = atan2(end.y - start.y, end.x - start.x)
+            let headLen = Swift.max(20, hypot(end.x - start.x, end.y - start.y) * 0.2)
+            let a1 = angle + .pi * 5 / 6
+            let a2 = angle - .pi * 5 / 6
+            path.move(to: start); path.addLine(to: end)
+            path.move(to: end)
+            path.addLine(to: CGPoint(x: end.x + headLen * cos(a1), y: end.y + headLen * sin(a1)))
+            path.move(to: end)
+            path.addLine(to: CGPoint(x: end.x + headLen * cos(a2), y: end.y + headLen * sin(a2)))
+        case .triangle:
+            path.move(to: CGPoint(x: rect.midX, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+            path.closeSubpath()
+        }
+        return path
+    }
+
     private func toContent(_ vp: CGPoint) -> CGPoint {
         CGPoint(x: vp.x, y: vp.y + scrollOffset)
     }
