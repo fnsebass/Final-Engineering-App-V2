@@ -119,6 +119,16 @@ struct LayoutSettingsView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 4)
                 }
+
+                // MARK: - Support & Legal
+                Section("Support & Legal") {
+                    Link(destination: URL(string: "https://github.com/fnsebass/Final-Engineering-App-V2")!) {
+                        Label("Support", systemImage: "questionmark.circle")
+                    }
+                    Link(destination: URL(string: "https://github.com/fnsebass/Final-Engineering-App-V2")!) {
+                        Label("Privacy Policy", systemImage: "hand.raised")
+                    }
+                }
             }
             .navigationTitle("Customize Layout")
             #if os(iOS)
