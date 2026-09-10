@@ -109,5 +109,14 @@ enum PaperTheme {
     static func gridUIColor(forPaperHex hex: String) -> UIColor {
         inkUIColor(forPaperHex: hex).withAlphaComponent(0.25)
     }
+
+    /// A slightly darker shade of the given color — used for a book cover's
+    /// own border, so the border always reads as "the same color, one shade
+    /// darker" rather than a fixed black/gray line.
+    static func darkerColor(fromHex hex: String, by amount: CGFloat = 0.13) -> Color {
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        uiColor(fromHex: hex).getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+        return Color(uiColor: UIColor(hue: h, saturation: s, brightness: max(b - amount, 0), alpha: a))
+    }
 }
 #endif

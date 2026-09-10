@@ -28,39 +28,67 @@ struct AIResultPanel: View {
     let isAnalyzing: Bool
     let onRerun: () -> Void
     let onClose: () -> Void
+    var onDrag: (CGSize) -> Void = { _ in }
+
+    @State private var prevDrag: CGSize = .zero
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    recognizedSection
-                    if mode != .chemistry { unitSection }
-                    aiSection
+        VStack(spacing: 0) {
+            dragHandle
+            NavigationStack {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        recognizedSection
+                        if mode != .chemistry { unitSection }
+                        aiSection
+                    }
+                    .padding()
                 }
-                .padding()
-            }
-            .overlay(alignment: .bottomTrailing) {
-                Button(action: onClose) {
-                    Label("Back", systemImage: "chevron.left")
-                        .font(.subheadline.weight(.semibold))
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                }
-                .background(.regularMaterial, in: Capsule())
-                .overlay(Capsule().strokeBorder(.quaternary, lineWidth: 0.5))
-                .shadow(radius: 6, y: 2)
-                .padding([.trailing, .bottom], 16)
-            }
-            .navigationTitle(mode == .explain ? "How to Solve" : mode == .chemistry ? "Chemistry" : "Calculation Check")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
+                .overlay(alignment: .bottomTrailing) {
                     Button(action: onClose) {
                         Label("Back", systemImage: "chevron.left")
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
                     }
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.quaternary, lineWidth: 0.5))
+                    .shadow(radius: 6, y: 2)
+                    .padding([.trailing, .bottom], 16)
                 }
+                .navigationTitle(mode == .explain ? "How to Solve" : mode == .chemistry ? "Chemistry" : "Calculation Check")
+                .navigationBarTitleDisplayMode(.inline)
             }
         }
+        .frame(width: 420)
+        .frame(maxHeight: 520)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(.quaternary, lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.2), radius: 12, y: 4)
+    }
+
+    // MARK: - Drag handle
+
+    /// A grabber bar so the panel can be dragged anywhere on the canvas.
+    private var dragHandle: some View {
+        Capsule()
+            .fill(Color.secondary.opacity(0.35))
+            .frame(width: 36, height: 5)
+            .frame(maxWidth: .infinity)
+            .frame(height: 22)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture()
+                    .onChanged { v in
+                        let delta = CGSize(
+                            width:  v.translation.width  - prevDrag.width,
+                            height: v.translation.height - prevDrag.height
+                        )
+                        prevDrag = v.translation
+                        onDrag(delta)
+                    }
+                    .onEnded { _ in prevDrag = .zero }
+            )
     }
 
     // MARK: - Recognized Equation
@@ -102,7 +130,7 @@ struct AIResultPanel: View {
                     .font(.caption2.weight(.semibold))
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(Color.secondary.opacity(0.15), in: Capsule())
+                    .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
                     .foregroundStyle(.secondary)
             }
 
@@ -302,7 +330,7 @@ struct AIResultPanel: View {
                                     .font(.caption2.weight(.semibold))
                                     .padding(.horizontal, 7)
                                     .padding(.vertical, 3)
-                                    .background(Color.orange.opacity(0.18), in: Capsule())
+                                    .background(Color.orange.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
                                     .foregroundStyle(.orange)
                             }
                             Text(err.reason)

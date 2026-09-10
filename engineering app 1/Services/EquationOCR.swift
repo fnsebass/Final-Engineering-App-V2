@@ -81,6 +81,19 @@ enum EquationOCR {
                 try handler.perform([request])
                 guard let results = request.results, !results.isEmpty else { return "" }
 
+                // Returns the top candidate, or "top[or second]" when a
+                // close-confidence second candidate exists — see the call
+                // site below for why this matters for isolated glyphs.
+                func withAlternate(_ obs: VNRecognizedTextObservation) -> String {
+                    let candidates = obs.topCandidates(2)
+                    guard let top = candidates.first else { return "" }
+                    guard candidates.count > 1 else { return top.string }
+                    let second = candidates[1]
+                    guard second.string != top.string,
+                          second.confidence > top.confidence - 0.2 else { return top.string }
+                    return "\(top.string)[or \(second.string)]"
+                }
+
                 // ── Pass 1: fraction / derivative detection ───────────────────
                 // Sort top-to-bottom (Vision y=0 is image bottom; higher minY = top).
                 let sorted = results.sorted { $0.boundingBox.minY > $1.boundingBox.minY }
@@ -117,8 +130,15 @@ enum EquationOCR {
                         }
                     }
 
+                    // Vision's #1 guess for an isolated glyph is often wrong
+                    // (e.g. "x" read as "z", "+" read as "="), because its
+                    // language model has nothing to anchor on for a single
+                    // symbol. When there's a close second candidate, surface
+                    // it inline as "x[or z]" so the downstream math-aware AI
+                    // — which CAN use the surrounding equation to disambiguate
+                    // — sees the ambiguity instead of silently losing it.
                     used.insert(i)
-                    parts.append(topText)
+                    parts.append(withAlternate(obs))
                 }
 
                 var s = parts

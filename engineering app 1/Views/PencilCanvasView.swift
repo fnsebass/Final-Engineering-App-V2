@@ -18,9 +18,15 @@
 //    position. On pencil-up it commits a PKStroke built from evenly-spaced
 //    control points, giving a clean uniform straight line in PencilKit.
 //
-//  Apple Pencil interactions:
-//    • Squeeze (Pencil Pro)  → hold to activate eraser, release to restore tool
+//  Apple Pencil interactions (UIPencilInteractionDelegate — hardware events,
+//  unrelated to the finger double-tap gesture recognizer below):
+//    • Squeeze (Pencil Pro)  → opens the curved RadialToolMenu palette by default
 //    • Double-tap (Pencil 2) → toggle eraser on/off
+//    (Both configurable in Settings → Writing → Pen Buttons.)
+//
+//  Finger double-tap on the canvas opens the quick-action menu
+//  (Graph/Chemistry/AI Help), handled entirely separately via a
+//  UITapGestureRecognizer restricted to `.direct` (finger) touches.
 //
 
 #if os(iOS)
@@ -47,13 +53,39 @@ struct PencilCanvasView: UIViewRepresentable {
         return 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.5
     }
 
-    var onLongPressPreview: (CGPoint) -> Void = { _ in }
-    var onLongPressPreviewEnd: () -> Void = {}
-    var onLongPress: (CGPoint, UIImage) -> Void = { _, _ in }
+    var onDoubleTapMenu: (CGPoint, UIImage) -> Void = { _, _ in }
+    /// Called ~1s after the user stops drawing, with a capture of the region
+    /// around their most recent stroke, so CanvasWorkspace can automatically
+    /// check it and show a check/X badge.
+    var onLiveCheckRegion: (CGPoint, UIImage) -> Void = { _, _ in }
     var onPencilSqueezeBegan: () -> Void = {}
     var onPencilSqueezeEnded: () -> Void = {}
+    var onRequestTool: (DrawingTool) -> Void = { _ in }
+    var onSwitchColor: () -> Void = {}
+    /// Settings → Pen Buttons: fired when squeeze (default) or double-tap is
+    /// mapped to "Show Tool Palette" — opens RadialToolMenu at the pencil's
+    /// current (or last known) position, in canvas view-space coordinates.
+    var onShowToolPalette: (CGPoint) -> Void = { _ in }
+    var onUndoManagerReady: (UndoManager?) -> Void = { _ in }
+    /// Called when the canvas needs to be torn down and rebuilt from scratch
+    /// (see the "zombie canvas" comment in `canvasViewDrawingDidChange`). The
+    /// caller should respond by changing this view's `.id()`.
+    var onNeedsRecreate: () -> Void = {}
 
     func makeCoordinator() -> Coordinator { Coordinator(page: page) }
+
+    /// Settings → Gestures & Touch: "Finger Touch Does" + "Ignore Touch Input
+    /// While Pencil Is Active" map directly onto PKCanvasView's own
+    /// drawingPolicy — .pencilOnly (finger only pans), .anyInput (finger can
+    /// always draw), or .default (finger can draw until Pencil is used, then
+    /// locks to Pencil — exactly the "touch lockout" behavior).
+    static func resolvedDrawingPolicy() -> PKCanvasViewDrawingPolicy {
+        let fingerAction = UserDefaults.standard.string(forKey: "settings.gestures.fingerAction")
+            ?? FingerAction.pan.rawValue
+        guard fingerAction == FingerAction.draw.rawValue else { return .pencilOnly }
+        let lockout = (UserDefaults.standard.object(forKey: "settings.gestures.touchLockout") as? Bool) ?? true
+        return lockout ? .default : .anyInput
+    }
 
     /// Converts a SwiftUI Color to a fixed (non-adaptive) UIColor for PKInkingTool.
     /// PKCanvasView in dark mode inverts dynamic colors, so we resolve to explicit sRGB
@@ -79,7 +111,7 @@ struct PencilCanvasView: UIViewRepresentable {
 
         canvas.backgroundColor = .clear
         canvas.isOpaque        = false
-        canvas.drawingPolicy   = .pencilOnly
+        canvas.drawingPolicy   = Self.resolvedDrawingPolicy()
         canvas.isScrollEnabled = true
         canvas.alwaysBounceVertical = true
         canvas.contentInsetAdjustmentBehavior = .never
@@ -102,36 +134,44 @@ struct PencilCanvasView: UIViewRepresentable {
             coord?.commitLine(from: start, to: end)
         }
 
-        // 0.2 s: preview ring
-        let earlyPress = UILongPressGestureRecognizer(
+        // Finger double-tap → quick-action menu (Graph/Chemistry/AI Help) + OCR capture.
+        let doubleTap = UITapGestureRecognizer(
             target: context.coordinator,
-            action: #selector(Coordinator.handleEarlyPress(_:))
+            action: #selector(Coordinator.handleDoubleTap(_:))
         )
-        earlyPress.minimumPressDuration = 0.2
-        earlyPress.allowableMovement = 8
-        earlyPress.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
-        earlyPress.cancelsTouchesInView = false
-        earlyPress.delaysTouchesBegan   = false
-        earlyPress.delegate = context.coordinator
-        canvas.addGestureRecognizer(earlyPress)
+        doubleTap.numberOfTapsRequired = 2
+        doubleTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        doubleTap.delegate = context.coordinator
+        canvas.addGestureRecognizer(doubleTap)
 
-        // 0.4 s: context menu + OCR capture
-        let fullPress = UILongPressGestureRecognizer(
+        // Settings → Writing → Gestures & Touch: two-finger undo / three-finger redo.
+        // Recognizers are always installed; the coordinator checks the toggle
+        // before acting so it stays live-updatable without recreating the view.
+        let twoFingerUndo = UITapGestureRecognizer(
             target: context.coordinator,
-            action: #selector(Coordinator.handleLongPress(_:))
+            action: #selector(Coordinator.handleTwoFingerUndo(_:))
         )
-        fullPress.minimumPressDuration = 0.4
-        fullPress.allowableMovement = 8
-        fullPress.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
-        fullPress.cancelsTouchesInView = false
-        fullPress.delaysTouchesBegan   = false
-        fullPress.delegate = context.coordinator
-        canvas.addGestureRecognizer(fullPress)
+        twoFingerUndo.numberOfTouchesRequired = 2
+        twoFingerUndo.cancelsTouchesInView = false
+        twoFingerUndo.delegate = context.coordinator
+        canvas.addGestureRecognizer(twoFingerUndo)
+
+        let threeFingerRedo = UITapGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleThreeFingerRedo(_:))
+        )
+        threeFingerRedo.numberOfTouchesRequired = 3
+        threeFingerRedo.cancelsTouchesInView = false
+        threeFingerRedo.delegate = context.coordinator
+        canvas.addGestureRecognizer(threeFingerRedo)
 
         context.coordinator.isDarkPaper           = isDarkPaper
-        context.coordinator.onLongPressPreview    = onLongPressPreview
-        context.coordinator.onLongPressPreviewEnd = onLongPressPreviewEnd
-        context.coordinator.onLongPress           = onLongPress
+        context.coordinator.onDoubleTapMenu       = onDoubleTapMenu
+        context.coordinator.onLiveCheckRegion     = onLiveCheckRegion
+        context.coordinator.onRequestTool         = onRequestTool
+        context.coordinator.onSwitchColor         = onSwitchColor
+        context.coordinator.onShowToolPalette     = onShowToolPalette
+        context.coordinator.onNeedsRecreate       = onNeedsRecreate
 
         // Wire shape overlay commit callback — reads current shapeKind from overlay at commit time.
         context.coordinator.shapeOverlay = wrapper.shapeOverlay
@@ -144,6 +184,17 @@ struct PencilCanvasView: UIViewRepresentable {
         pencilInteraction.delegate = context.coordinator
         canvas.addInteraction(pencilInteraction)
 
+        // Tracks where the Pencil currently is (while hovering, on supported
+        // hardware) so the tool palette can appear right where it's being
+        // held rather than at a fixed toolbar position.
+        let hover = UIHoverGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleHover(_:))
+        )
+        canvas.addGestureRecognizer(hover)
+
+        onUndoManagerReady(canvas.undoManager)
+
         return wrapper
     }
 
@@ -154,11 +205,15 @@ struct PencilCanvasView: UIViewRepresentable {
         let shapeOvr    = wrapper.shapeOverlay
 
         coord.isDarkPaper           = isDarkPaper
-        coord.onLongPressPreview    = onLongPressPreview
-        coord.onLongPressPreviewEnd = onLongPressPreviewEnd
-        coord.onLongPress           = onLongPress
+        coord.onDoubleTapMenu       = onDoubleTapMenu
+        coord.onLiveCheckRegion     = onLiveCheckRegion
         coord.onPencilSqueezeBegan  = onPencilSqueezeBegan
         coord.onPencilSqueezeEnded  = onPencilSqueezeEnded
+        coord.onRequestTool        = onRequestTool
+        coord.onSwitchColor        = onSwitchColor
+        coord.onShowToolPalette    = onShowToolPalette
+        coord.onNeedsRecreate      = onNeedsRecreate
+        canvas.drawingPolicy       = Self.resolvedDrawingPolicy()
 
         let paper = PaperTheme.uiColor(fromHex: paperColorHex)
         wrapper.gridView.setup(style: paperStyle, columns: gridColumns, paper: paper)
@@ -219,6 +274,7 @@ struct PencilCanvasView: UIViewRepresentable {
         var activeTool: DrawingTool = .pen
         var isDrawing  = false
         private var isResettingCanvas = false
+        private var liveCheckTask: Task<Void, Never>? = nil
 
         // Ink state used when building straight-line and shape PKStrokes.
         var currentInkColor: UIColor = .black
@@ -231,54 +287,110 @@ struct PencilCanvasView: UIViewRepresentable {
 
         var isDarkPaper = false
 
-        var onLongPressPreview: (CGPoint) -> Void = { _ in }
-        var onLongPressPreviewEnd: () -> Void = {}
-        var onLongPress: (CGPoint, UIImage) -> Void = { _, _ in }
+        var onDoubleTapMenu: (CGPoint, UIImage) -> Void = { _, _ in }
+        var onLiveCheckRegion: (CGPoint, UIImage) -> Void = { _, _ in }
         var onPencilSqueezeBegan: () -> Void = {}
         var onPencilSqueezeEnded: () -> Void = {}
+        var onRequestTool: (DrawingTool) -> Void = { _ in }
+        var onSwitchColor: () -> Void = {}
+        var onShowToolPalette: (CGPoint) -> Void = { _ in }
+        var onNeedsRecreate: () -> Void = {}
+
+        /// Updated live while the Pencil hovers above the canvas (supported
+        /// hardware only). Left stale — i.e. "last known" — once the Pencil
+        /// moves out of hover range or touches down to draw.
+        private var lastHoverViewPosition: CGPoint? = nil
 
         init(page: Page) { self.page = page }
 
-        // Gesture recognizer delegate — both long-press recognizers fire simultaneously.
+        // Gesture recognizer delegate — recognizers fire simultaneously.
         func gestureRecognizer(_ gr: UIGestureRecognizer,
                                shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
         func gestureRecognizer(_ gr: UIGestureRecognizer,
                                shouldRequireFailureOf other: UIGestureRecognizer) -> Bool { false }
 
-        // MARK: Long press
+        // MARK: Finger double-tap → quick-action menu
 
-        @objc func handleEarlyPress(_ gesture: UILongPressGestureRecognizer) {
-            guard let canvas = canvas else { return }
-            switch gesture.state {
-            case .began:
-                onLongPressPreview(viewPos(for: gesture, in: canvas))
-            case .ended, .cancelled, .failed:
-                onLongPressPreviewEnd()
-            default: break
+        @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
+            guard gesture.state == .ended, let canvas = canvas else { return }
+            let contentPos = gesture.location(in: canvas)
+            let region = CGRect(x: contentPos.x - 400, y: contentPos.y - 220, width: 800, height: 440)
+            onDoubleTapMenu(viewPos(for: gesture, in: canvas),
+                            captureOCRImage(from: canvas.drawing, region: region))
+        }
+
+        // MARK: Multi-touch undo/redo (Settings → Writing → Gestures & Touch)
+
+        @objc func handleTwoFingerUndo(_ gesture: UITapGestureRecognizer) {
+            guard gesture.state == .ended,
+                  UserDefaults.standard.bool(forKey: "settings.gestures.twoFingerUndo") else { return }
+            canvas?.undoManager?.undo()
+        }
+
+        @objc func handleThreeFingerRedo(_ gesture: UITapGestureRecognizer) {
+            guard gesture.state == .ended,
+                  UserDefaults.standard.bool(forKey: "settings.gestures.threeFingerRedo") else { return }
+            canvas?.undoManager?.redo()
+        }
+
+        // MARK: Pen button action mapping (Settings → Writing → Pen Buttons)
+
+        /// Performs a one-shot action for every `PenButtonAction` other than
+        /// `.toggleEraser`, which needs hold/restore state handled by the caller.
+        private func performOneShotPenButtonAction(_ raw: String) {
+            switch raw {
+            case "undo":         canvas?.undoManager?.undo()
+            case "redo":         canvas?.undoManager?.redo()
+            case "switchColors": onSwitchColor()
+            case "triggerLasso": onRequestTool(.lasso)
+            case "showToolPalette": onShowToolPalette(resolvedPencilViewPosition())
+            default: break // "none" or unrecognized
             }
         }
 
-        @objc func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
-            guard gesture.state == .began, let canvas = canvas else { return }
-            let contentPos = gesture.location(in: canvas)
-            onLongPress(viewPos(for: gesture, in: canvas),
-                        captureOCRImage(from: canvas.drawing, around: contentPos))
-        }
-
-        private func viewPos(for gesture: UILongPressGestureRecognizer, in canvas: CanvasView) -> CGPoint {
+        private func viewPos(for gesture: UIGestureRecognizer, in canvas: CanvasView) -> CGPoint {
             let p = gesture.location(in: canvas)
             return CGPoint(x: p.x, y: p.y - canvas.contentOffset.y)
         }
 
-        private func captureOCRImage(from drawing: PKDrawing, around center: CGPoint) -> UIImage {
-            let region = CGRect(x: center.x - 400, y: center.y - 220, width: 800, height: 440)
+        // MARK: Pencil hover tracking (for palette positioning)
 
+        @objc func handleHover(_ gesture: UIHoverGestureRecognizer) {
+            guard let canvas = canvas else { return }
+            switch gesture.state {
+            case .began, .changed:
+                let p = gesture.location(in: canvas)
+                lastHoverViewPosition = CGPoint(x: p.x, y: p.y - canvas.contentOffset.y)
+            default:
+                break // Pencil moved out of hover range — keep the last known spot.
+            }
+        }
+
+        /// Where the Pencil currently is (if hovering), or was last known to
+        /// be (last hover point, or failing that the end of the most recent
+        /// stroke), or the middle of the visible canvas if none of that is
+        /// available yet.
+        func resolvedPencilViewPosition() -> CGPoint {
+            if let hover = lastHoverViewPosition { return hover }
+            if let canvas = canvas,
+               let lastPoint = canvas.drawing.strokes.last?.path.last?.location {
+                return CGPoint(x: lastPoint.x, y: lastPoint.y - canvas.contentOffset.y)
+            }
+            if let canvas = canvas {
+                return CGPoint(x: canvas.bounds.midX, y: canvas.bounds.midY)
+            }
+            return CGPoint(x: 200, y: 200)
+        }
+
+        private func captureOCRImage(from drawing: PKDrawing, region: CGRect) -> UIImage {
             // Always render in light mode so PencilKit uses the stored (light-resolved)
             // ink colors regardless of the system's dark/light setting.
             // On dark paper the ink is light; we composite on black then invert for OCR.
+            // Scale 3 (not 2) gives Vision sharper glyph edges to disambiguate
+            // visually similar handwritten characters.
             var inkImage = UIImage()
             UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
-                inkImage = drawing.image(from: region, scale: 2)
+                inkImage = drawing.image(from: region, scale: 3)
             }
 
             let format = UIGraphicsImageRendererFormat.default()
@@ -455,18 +567,73 @@ struct PencilCanvasView: UIViewRepresentable {
                 let needed = canvas.drawing.bounds.maxY + 600
                 if canvas.contentSize.height < needed { grow(canvas, to: needed + 1600) }
 
-                // PKCanvasView enters a zombie state when the last stroke is erased.
-                // Assigning a fresh PKDrawing() wakes it up, but doing so synchronously
-                // inside this callback triggers PencilKit's "Drawing count mismatch" warning
-                // because PencilKit's own stroke-count update hasn't finished yet.
-                // Deferring one run loop cycle lets PencilKit settle before we reassign.
-                // The flag prevents the deferred assignment from re-entering this block.
+                // PKCanvasView enters a zombie state when the last stroke is
+                // erased — it keeps accepting touches for panning/menus but
+                // silently stops turning pencil input into new strokes.
+                // In-place workarounds (reassigning .drawing/.tool, toggling
+                // isUserInteractionEnabled) do not reliably recover it. The
+                // only thing confirmed to fix it is a full teardown/rebuild
+                // (e.g. leaving and reopening the note), so rather than
+                // patch this PKCanvasView in place, ask CanvasWorkspace to
+                // recreate it from scratch via a fresh `.id()`. Deferred one
+                // run loop cycle so PencilKit's own stroke-count update
+                // finishes first; the flag blocks this same (soon-discarded)
+                // coordinator from re-entering before that happens.
                 if canvasView.drawing.strokes.isEmpty {
                     isResettingCanvas = true
-                    DispatchQueue.main.async { [weak self, weak canvasView] in
-                        if let cv = canvasView { cv.drawing = PKDrawing() }
-                        self?.isResettingCanvas = false
+                    DispatchQueue.main.async { [weak self] in
+                        self?.onNeedsRecreate()
                     }
+                }
+            }
+            scheduleLiveCheck(for: canvasView)
+        }
+
+        // MARK: Live equation checking (debounced)
+
+        /// Settings → Tutor & Recognition → Real-Time Equation Checking.
+        /// Defaults to true when the key hasn't been written yet, since the
+        /// Settings toggle itself defaults to on.
+        private static var liveReviewEnabled: Bool {
+            (UserDefaults.standard.object(forKey: "settings.tutor.liveReviewEnabled") as? Bool) ?? true
+        }
+
+        /// Cancels any pending check and starts a new one ~1s out, so rapid
+        /// strokes don't trigger a check per-stroke — only once the user
+        /// pauses. Captures the actual bounding box of the whole equation
+        /// (not a fixed-size box around just the last stroke) so long or wide
+        /// equations aren't clipped before OCR ever sees them — a major
+        /// source of misreads, since a clipped character reads as garbage.
+        private func scheduleLiveCheck(for canvasView: PKCanvasView) {
+            liveCheckTask?.cancel()
+            guard Self.liveReviewEnabled else { return }
+            guard let lastStroke = canvasView.drawing.strokes.last else { return }
+            let drawing = canvasView.drawing
+            let lastBounds = lastStroke.renderBounds
+            // Generous search window around the last stroke to find the rest
+            // of the equation it belongs to.
+            let searchRegion = lastBounds.insetBy(dx: -400, dy: -220)
+
+            // Union the bounds of every stroke inside the search window (not
+            // just the last one) so both the OCR capture and the badge anchor
+            // cover the whole equation rather than wherever the most recent
+            // stroke happens to sit within it.
+            let equationBounds = drawing.strokes
+                .map(\.renderBounds)
+                .filter { searchRegion.intersects($0) }
+                .reduce(lastBounds) { $0.union($1) }
+            let topLeft = CGPoint(x: equationBounds.minX, y: equationBounds.minY)
+            // Pad the actual capture so characters right at the equation's
+            // edge (a leading "-", a trailing digit) aren't clipped.
+            let captureRegion = equationBounds.insetBy(dx: -50, dy: -50)
+
+            liveCheckTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled, let self, let canvas = self.canvas else { return }
+                let image = self.captureOCRImage(from: drawing, region: captureRegion)
+                let viewPos = CGPoint(x: topLeft.x, y: topLeft.y - canvas.contentOffset.y)
+                await MainActor.run {
+                    self.onLiveCheckRegion(viewPos, image)
                 }
             }
         }
@@ -479,8 +646,15 @@ struct PencilCanvasView: UIViewRepresentable {
 
         // MARK: UIPencilInteractionDelegate
 
-        // Apple Pencil 2 double-tap → toggle eraser on / off.
+        // Apple Pencil 2 double-tap. Default action toggles the eraser on/off;
+        // Settings → Writing → Pen Buttons can remap it to Undo/Redo/Switch
+        // Colors/Trigger Lasso/No Action instead.
         func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
+            let action = UserDefaults.standard.string(forKey: "settings.penButtons.doubleClick") ?? "toggleEraser"
+            guard action == "toggleEraser" else {
+                performOneShotPenButtonAction(action)
+                return
+            }
             if activeTool == .eraser {
                 if let saved = toolBeforeSqueeze { canvas?.tool = saved }
                 toolBeforeSqueeze = nil
@@ -492,15 +666,24 @@ struct PencilCanvasView: UIViewRepresentable {
             }
         }
 
-        // Apple Pencil Pro squeeze → hold-to-erase.
+        // Apple Pencil Pro squeeze. Default action holds the eraser while
+        // squeezed; Settings → Writing → Pen Buttons can remap the squeeze
+        // to a one-shot Undo/Redo/Switch Colors/Trigger Lasso/No Action instead.
         func pencilInteraction(_ interaction: UIPencilInteraction,
                                didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
+            let action = UserDefaults.standard.string(forKey: "settings.penButtons.singleClick")
+                ?? PenButtonAction.showToolPalette.rawValue
             switch squeeze.phase {
             case .began:
+                guard action == "toggleEraser" else {
+                    performOneShotPenButtonAction(action)
+                    return
+                }
                 toolBeforeSqueeze = canvas?.tool
                 canvas?.tool = PKEraserTool(.vector)
                 onPencilSqueezeBegan()
             case .ended, .cancelled:
+                guard action == "toggleEraser" else { return }
                 if let saved = toolBeforeSqueeze { canvas?.tool = saved }
                 toolBeforeSqueeze = nil
                 onPencilSqueezeEnded()
@@ -865,6 +1048,12 @@ final class GridContentView: UIView {
     private(set) var currentColumns: Int = 16
     private var lineColor: UIColor = UIColor(red: 0.0, green: 0.47, blue: 0.84, alpha: 0.4)
 
+    // Settings → Paper & Layout → Margins / Page Size, re-read on every
+    // setup() call (which SwiftUI drives via updateUIView often enough to
+    // pick up changes live).
+    private var marginPt: CGFloat = 0
+    private var pageHeightPt: CGFloat? = nil
+
     var scrollOffset: CGFloat = 0
 
     func setup(style: PaperStyle, columns: Int, paper: UIColor) {
@@ -878,30 +1067,40 @@ final class GridContentView: UIView {
             ? UIColor(red: 0.0, green: 0.47, blue: 0.84, alpha: 0.4)
             : UIColor(white: 0.85, alpha: 0.4)
 
+        let marginRaw = UserDefaults.standard.object(forKey: "settings.paper.margin") as? Double
+        marginPt = CGFloat(marginRaw ?? 24.0)
+
+        let dimRaw = UserDefaults.standard.string(forKey: "settings.paper.pageDimension")
+            ?? PageDimension.infinite.rawValue
+        switch PageDimension(rawValue: dimRaw) ?? .infinite {
+        case .a4:       pageHeightPt = 1123   // A4 (11.69in) at 96pt/in
+        case .letter:   pageHeightPt = 1056   // Letter (11in) at 96pt/in
+        case .infinite: pageHeightPt = nil
+        }
+
         backgroundColor          = paper
         isUserInteractionEnabled = false
         setNeedsDisplay()
     }
 
     override func draw(_ rect: CGRect) {
-        guard currentStyle != .blank, bounds.width > 0,
-              let ctx = UIGraphicsGetCurrentContext() else { return }
+        guard bounds.width > 0, let ctx = UIGraphicsGetCurrentContext() else { return }
 
         let spacing = bounds.width / CGFloat(currentColumns)
-        guard spacing >= 3 else { return }
 
-        ctx.setStrokeColor(lineColor.cgColor)
-        ctx.setFillColor(lineColor.cgColor)
-        ctx.setLineWidth(0.5)
+        if currentStyle != .blank, spacing >= 3 {
+            ctx.setStrokeColor(lineColor.cgColor)
+            ctx.setFillColor(lineColor.cgColor)
+            ctx.setLineWidth(0.5)
 
-        let kMin   = Int(ceil((rect.minY + scrollOffset) / spacing))
-        let firstY = CGFloat(max(kMin, 0)) * spacing - scrollOffset
+            let kMin   = Int(ceil((rect.minY + scrollOffset) / spacing))
+            let firstY = CGFloat(max(kMin, 0)) * spacing - scrollOffset
 
-        switch currentStyle {
-        case .blank:
-            break
+            switch currentStyle {
+            case .blank:
+                break
 
-        case .grid:
+            case .grid:
             var x: CGFloat = 0
             while x <= bounds.width + 0.5 {
                 ctx.move(to: CGPoint(x: x, y: rect.minY))
@@ -936,6 +1135,41 @@ final class GridContentView: UIView {
                 }
                 y += spacing
             }
+            }
+        }
+
+        // Page-break guides (Settings → Paper & Layout → Page Size). Purely
+        // visual — the canvas still scrolls continuously rather than paginating.
+        if let pageH = pageHeightPt, pageH > 0 {
+            ctx.saveGState()
+            ctx.setStrokeColor(UIColor.systemOrange.withAlphaComponent(0.45).cgColor)
+            ctx.setLineWidth(1)
+            ctx.setLineDash(phase: 0, lengths: [6, 4])
+            let kMin = Int(floor((rect.minY + scrollOffset) / pageH))
+            var y = CGFloat(kMin) * pageH - scrollOffset
+            while y <= rect.maxY + 0.5 {
+                if y >= rect.minY - 0.5 {
+                    ctx.move(to: CGPoint(x: 0, y: y))
+                    ctx.addLine(to: CGPoint(x: bounds.width, y: y))
+                }
+                y += pageH
+            }
+            ctx.strokePath()
+            ctx.restoreGState()
+        }
+
+        // Margin guides (Settings → Paper & Layout → Margins).
+        if marginPt > 0 {
+            ctx.saveGState()
+            ctx.setStrokeColor(UIColor.systemBlue.withAlphaComponent(0.3).cgColor)
+            ctx.setLineWidth(1)
+            ctx.setLineDash(phase: 0, lengths: [3, 3])
+            for x in [marginPt, bounds.width - marginPt] {
+                ctx.move(to: CGPoint(x: x, y: rect.minY))
+                ctx.addLine(to: CGPoint(x: x, y: rect.maxY))
+            }
+            ctx.strokePath()
+            ctx.restoreGState()
         }
     }
 }

@@ -46,10 +46,26 @@ final class Notepad {
         set { paperStyleRaw = newValue.rawValue }
     }
 
-    /// The folder this notepad belongs to, or nil if it's loose in the sidebar.
+    /// The folder (book) this notepad belongs to, or nil if it's loose in the sidebar.
     var folder: Folder?
 
-    init(title: String = "New Derivation", createdDate: Date = .now) {
+    /// The chapter this note belongs to within its book, or nil if it's
+    /// filed in a book but not yet assigned to a chapter. Kept in sync with
+    /// `folder` via `assign(to:)` rather than derived, so Home's existing
+    /// folder-based filtering/drag-drop logic needs no changes.
+    var chapter: Chapter?
+
+    /// Files this note into `chapter` and its parent book in one step.
+    func assign(to chapter: Chapter) {
+        self.chapter = chapter
+        self.folder = chapter.folder
+    }
+
+    /// Expressions previously plotted from this note, most recent last.
+    /// Surfaced as the "Graphs" section of the notebook side panel.
+    var graphHistory: [String] = []
+
+    init(title: String = "New Note", createdDate: Date = .now) {
         self.title = title
         self.createdDate = createdDate
         self.lastEditedDate = createdDate

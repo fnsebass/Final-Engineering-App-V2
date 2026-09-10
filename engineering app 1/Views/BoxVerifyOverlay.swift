@@ -159,7 +159,7 @@ struct BoxVerifyOverlay: View {
             Label("Analyze with Gemini", systemImage: "sparkles")
                 .font(.subheadline.weight(.semibold))
                 .padding(.horizontal, 20).padding(.vertical, 11)
-                .background(Color.accentColor, in: Capsule())
+                .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 14))
                 .foregroundStyle(.white)
                 .shadow(color: Color.accentColor.opacity(0.45), radius: 12, y: 4)
         }
@@ -177,7 +177,7 @@ struct BoxVerifyOverlay: View {
             Text("Analyzing…").font(.subheadline.weight(.medium)).foregroundStyle(.white)
         }
         .padding(.horizontal, 20).padding(.vertical, 11)
-        .background(Color.accentColor.opacity(0.88), in: Capsule())
+        .background(Color.accentColor.opacity(0.88), in: RoundedRectangle(cornerRadius: 14))
         .position(pos)
     }
 
@@ -262,7 +262,7 @@ struct BoxVerifyOverlay: View {
                     Text("Retry")
                         .font(.caption.weight(.semibold))
                         .padding(.horizontal, 16).padding(.vertical, 7)
-                        .background(Color.orange.opacity(0.18), in: Capsule())
+                        .background(Color.orange.opacity(0.18), in: RoundedRectangle(cornerRadius: 8))
                         .foregroundStyle(.orange)
                 }
                 .buttonStyle(.plain)
@@ -270,7 +270,7 @@ struct BoxVerifyOverlay: View {
                     Text("Clear")
                         .font(.caption.weight(.semibold))
                         .padding(.horizontal, 16).padding(.vertical, 7)
-                        .background(Color.secondary.opacity(0.15), in: Capsule())
+                        .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 8))
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
@@ -292,7 +292,7 @@ struct BoxVerifyOverlay: View {
             .foregroundStyle(.white)
             .multilineTextAlignment(.center)
             .padding(.horizontal, 22).padding(.vertical, 12)
-            .background(.black.opacity(0.55), in: Capsule())
+            .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 14))
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             .allowsHitTesting(false)
             .transition(.opacity)

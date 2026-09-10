@@ -143,7 +143,7 @@ struct TrussEditorView: View {
                         .foregroundStyle(.white)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 6)
-                        .background(Color.orange.opacity(0.88), in: Capsule())
+                        .background(Color.orange.opacity(0.88), in: RoundedRectangle(cornerRadius: 8))
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                         .padding(.top, 10)
                         .allowsHitTesting(false)
@@ -251,7 +251,7 @@ struct TrussEditorView: View {
                     .foregroundStyle(.primary)
                     .padding(.horizontal, 8)
                     .frame(height: 26)
-                    .background(Color.primary.opacity(0.08), in: Capsule())
+                    .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 4)

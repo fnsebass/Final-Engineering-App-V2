@@ -182,7 +182,7 @@ struct FBDEditorView: View {
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(isSimulating ? Color.red : Color.green)
                         .padding(.horizontal, 8).frame(height: 26)
-                        .background((isSimulating ? Color.red : Color.green).opacity(0.12), in: Capsule())
+                        .background((isSimulating ? Color.red : Color.green).opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
                 }.buttonStyle(.plain)
 
                 // Recenter
@@ -216,7 +216,7 @@ struct FBDEditorView: View {
                     Label("Analyze", systemImage: "function")
                         .font(.system(size: 11, weight: .semibold)).foregroundStyle(.purple)
                         .padding(.horizontal, 8).frame(height: 26)
-                        .background(Color.purple.opacity(0.12), in: Capsule())
+                        .background(Color.purple.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
                 }.buttonStyle(.plain).padding(.trailing, 6)
             }
             .frame(height: 36)

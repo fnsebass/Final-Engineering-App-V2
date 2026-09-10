@@ -4,14 +4,15 @@
 //
 //  Hosts one notepad's infinite-scroll canvas. Manages:
 //    • The canvas + paper theme
-//    • Long-press context menu → graph / check / chemistry / AI
-//    • Handwriting disambiguation: OCR → apply stored corrections →
-//      AI ambiguity check → DisambiguationCard overlay → confirmed text →
-//      original action (graph/check/chem/AI). Confirmed corrections are
-//      saved as HandwritingCorrection entries and reused automatically.
+//    • Double-tap quick-action menu → graph / chemistry / AI, straight from
+//      OCR + stored corrections to the AI call (no confirmation step).
+//    • Live equation checking: ~1s after the user pauses, the last-written
+//      region is OCR'd and algebra-checked automatically; a check/X badge
+//      appears near it, tappable for the full floating AIResultPanel.
 //    • Ruler overlay
 //    • Graph: floating card (drag header to move, top-left handle to resize)
-//    • Left graph drawer (pin button docks graph; arrow tab reveals it)
+//      Quick Graph type-in and history live in the notebook side panel's
+//      Graphs tab, which requests a plot here via `requestedGraph`.
 //    • Photo import, placement, resize, and rotation
 //    • Apple Pencil squeeze-to-erase
 //
@@ -24,9 +25,39 @@ import SwiftUI
 import SwiftData
 import PhotosUI
 
-// MARK: - Pending action enum
+// MARK: - Live-check badge
 
-private enum CanvasAction { case graph, check, chemistry, ai }
+private struct LiveCheckBadge {
+    enum Status { case checking, correct, incorrect }
+    /// Top-left corner of the equation this badge is checking.
+    let anchor: CGPoint
+    var status: Status
+    var recognizedText: String = ""
+}
+
+/// Deliberately muted rather than a bright/saturated green or red, matching
+/// the rest of the app's duller accent palette.
+private let liveCheckGreen = Color(red: 0.42, green: 0.62, blue: 0.44)
+private let liveCheckRed   = Color(red: 0.72, green: 0.36, blue: 0.34)
+
+/// A faint ring that traces the outline of a circle while a live check is
+/// running, replacing the platform's default dotted/segmented spinner.
+private struct RingSpinner: View {
+    @State private var rotation: Double = 0
+
+    var body: some View {
+        Circle()
+            .trim(from: 0, to: 0.7)
+            .stroke(Color.secondary.opacity(0.45), style: StrokeStyle(lineWidth: 2, lineCap: .round))
+            .frame(width: 18, height: 18)
+            .rotationEffect(.degrees(rotation))
+            .onAppear {
+                withAnimation(.linear(duration: 0.9).repeatForever(autoreverses: false)) {
+                    rotation = 360
+                }
+            }
+    }
+}
 
 // MARK: - CanvasWorkspace
 
@@ -40,14 +71,23 @@ struct CanvasWorkspace: View {
     @Binding var isVerifyMode: Bool
     @Binding var showPhotoPicker: Bool
     let activeShapeKind: ShapeKind
+    var onUndoManagerReady: (UndoManager?) -> Void = { _ in }
+    /// Set (momentarily, by the notebook side panel's Graphs tab) to reopen a
+    /// previously-plotted expression. Not a Binding — the caller resets it to
+    /// nil right after setting it, so re-tapping the same history row still
+    /// triggers `.onChange` below.
+    var requestedGraph: String? = nil
 
     // Stored handwriting corrections (applied automatically before every action)
     @Query(sort: \HandwritingCorrection.useCount, order: .reverse)
     private var storedCorrections: [HandwritingCorrection]
 
-    // Long-press overlay
-    @State private var holdPos: CGPoint? = nil
+    // Double-tap quick-action menu overlay
     @State private var menuPos: CGPoint? = nil
+    // Anchor for the floating AIResultPanel — set alongside menuPos but not
+    // cleared when the quick-action menu is dismissed, since the panel opens
+    // after the menu (and its underlying pill) has already gone away.
+    @State private var panelAnchor: CGPoint = CGPoint(x: 200, y: 200)
     @State private var menuImage: UIImage? = nil
 
     // Side panel
@@ -77,11 +117,9 @@ struct CanvasWorkspace: View {
     @State private var graphCardCenter: CGPoint? = nil
     @State private var graphCardWidth: CGFloat = 540
 
-    // Graph — left drawer / pin
-    @State private var graphIsPinned = false
-    @State private var graphDrawerOpen = false
-    @State private var drawerTypeExpr: String = ""
-    @State private var drawerFocused = false
+    // Changing this forces PencilCanvasView to fully tear down and rebuild
+    // its PKCanvasView — see the "zombie canvas" fix in canvasViewDrawingDidChange.
+    @State private var canvasResetToken = UUID()
 
     // Photos
     @State private var selectedPhotoID: PersistentIdentifier? = nil
@@ -90,13 +128,35 @@ struct CanvasWorkspace: View {
     // Pencil squeeze-to-erase state
     @State private var toolBeforeErase: DrawingTool? = nil
 
-    // Disambiguation state
-    @State private var disambiguationQueue: [AmbiguousCharacter] = []
-    @State private var disambiguationIndex: Int = 0
-    @State private var disambiguationWorkingText: String = ""
-    @State private var pendingCanvasAction: CanvasAction? = nil
+    // Pen Buttons "Switch Colors" action reuses the same 5-slot pencil
+    // palette NotepadEditorView's header shows, so both stay in sync.
+    @AppStorage("selectedPencilSlot") private var selectedColorTag: Int = 0
+    @AppStorage("pencilSlot0") private var pencilHex0: String = "#262626"
+    @AppStorage("pencilSlot1") private var pencilHex1: String = "#173B9E"
+    @AppStorage("pencilSlot2") private var pencilHex2: String = "#D48008"
+    @AppStorage("pencilSlot3") private var pencilHex3: String = "#127038"
+    @AppStorage("pencilSlot4") private var pencilHex4: String = "#BD1414"
+
+    // Radial tool/color palette (Settings → Pen Buttons → "Show Tool Palette",
+    // the squeeze default) — anchored to the Pencil's current/last position.
+    @State private var radialPaletteAnchor: CGPoint? = nil
+
+    // Live equation-check badge
+    @State private var liveCheckBadge: LiveCheckBadge? = nil
+    /// Bumped on every new check request so a slow, stale request can't
+    /// overwrite the badge for a check that started after it.
+    @State private var liveCheckGeneration = 0
+
+    /// Tracks the workspace's own size so the floating AIResultPanel's drag
+    /// handler can clamp its position without needing a GeometryReader of its own.
+    @State private var workspaceSize: CGSize = .zero
 
     private let reviewService: any EquationReviewService = OnDeviceEquationReviewService()
+
+    // Settings → Intelligence → Tutor Interactions: off gives a brief answer
+    // check (reviewService.review) instead of a full step-by-step walkthrough
+    // (reviewService.explain).
+    @AppStorage(LayoutPrefs.aiVerbose) private var aiVerbose = true
 
     var body: some View {
         GeometryReader { geo in
@@ -112,20 +172,23 @@ struct CanvasWorkspace: View {
                         penColor: $penColor,
                         penWidth: 3,
                         activeShapeKind: activeShapeKind,
-                        onLongPressPreview: { pos in
-                            withAnimation(.easeIn(duration: 0.12)) { holdPos = pos }
-                        },
-                        onLongPressPreviewEnd: {
-                            withAnimation(.easeOut(duration: 0.15)) { holdPos = nil }
-                        },
-                        onLongPress: { pos, image in
-                            withAnimation { holdPos = nil }
+                        onDoubleTapMenu: { pos, image in
                             menuImage = image
                             menuPos = clamped(pos, in: geo.size)
+                            panelAnchor = clamped(pos, in: geo.size, boxSize: CGSize(width: 420, height: 520))
+                        },
+                        onLiveCheckRegion: { pos, image in
+                            handleLiveCheck(at: pos, image: image)
                         },
                         onPencilSqueezeBegan: handleSqueezeBegan,
-                        onPencilSqueezeEnded: handleSqueezeEnded
+                        onPencilSqueezeEnded: handleSqueezeEnded,
+                        onRequestTool: handleRequestTool,
+                        onSwitchColor: handleSwitchColor,
+                        onShowToolPalette: handleShowToolPalette,
+                        onUndoManagerReady: onUndoManagerReady,
+                        onNeedsRecreate: { canvasResetToken = UUID() }
                     )
+                    .id(canvasResetToken)
                     .ignoresSafeArea(.container, edges: .bottom)
 
                     // ── Photo layer (above canvas, below other overlays) ─
@@ -133,16 +196,6 @@ struct CanvasWorkspace: View {
                         .zIndex(1)
                 } else {
                     ProgressView("Preparing…").onAppear(perform: ensurePage)
-                }
-
-                // ── Hold preview ring ─────────────────────────────────────
-                if let pos = holdPos {
-                    Circle()
-                        .strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 2.5)
-                        .frame(width: 46, height: 46)
-                        .position(pos)
-                        .allowsHitTesting(false)
-                        .transition(.scale(scale: 0.6).combined(with: .opacity))
                 }
 
                 // ── Context menu ──────────────────────────────────────────
@@ -155,13 +208,32 @@ struct CanvasWorkspace: View {
                 }
 
                 if let pos = menuPos {
-                    LongPressMenu(
+                    QuickActionMenu(
                         onGraph:      handleGraph,
-                        onUnits:      handleUnits,
                         onChemistry:  handleChemistry,
                         onAI:         handleAI
                     )
                     .position(pos)
+                    .zIndex(10)
+                    .transition(.scale(scale: 0.85).combined(with: .opacity))
+                }
+
+                // ── Radial tool/color palette (Pencil squeeze) ────────────
+                if radialPaletteAnchor != nil {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .ignoresSafeArea()
+                        .onTapGesture { radialPaletteAnchor = nil }
+                        .zIndex(9)
+                }
+
+                if let anchor = radialPaletteAnchor {
+                    RadialToolMenu(
+                        activeTool: activeTool,
+                        onSelectTool: applyRadialTool,
+                        onSelectColor: applyRadialColor
+                    )
+                    .position(RadialToolMenu.frameCenter(forAnchor: anchor))
                     .zIndex(10)
                     .transition(.scale(scale: 0.85).combined(with: .opacity))
                 }
@@ -177,12 +249,12 @@ struct CanvasWorkspace: View {
                         .zIndex(5)
                 }
 
-                // ── Left graph drawer ──────────────────────────────────────
-                graphDrawer(geo: geo)
-                    .zIndex(7)
-
-                // ── Floating graph card ────────────────────────────────────
-                if showGraph && !graphIsPinned, let center = graphCardCenter {
+                // ── Floating graph card ─────────────────────────────────────
+                // Quick Graph's type-in field and history now live in the
+                // notebook side panel's Graphs tab (see ChapterSidebarView);
+                // every graph shown here is already recorded there, so
+                // there's no separate "pin" action anymore.
+                if showGraph, let center = graphCardCenter {
                     EquationGraphView(
                         equationText: graphEquationText,
                         expression: graphExpression,
@@ -205,12 +277,6 @@ struct CanvasWorkspace: View {
                                 let newX = (c.x + dw / 2).clamped(to: newW / 2 ... geo.size.width - newW / 2)
                                 graphCardCenter = CGPoint(x: newX, y: c.y)
                             }
-                        },
-                        onPin: {
-                            withAnimation(.spring(response: 0.3)) {
-                                graphIsPinned  = true
-                                graphDrawerOpen = true
-                            }
                         }
                     )
                     .frame(width: graphCardWidth)
@@ -219,27 +285,32 @@ struct CanvasWorkspace: View {
                     .zIndex(8)
                 }
 
-                // ── Disambiguation overlay ────────────────────────────────
-                if !disambiguationQueue.isEmpty,
-                   disambiguationIndex < disambiguationQueue.count {
-                    Color.black.opacity(0.08)
-                        .ignoresSafeArea()
-                        .zIndex(14)
-
-                    DisambiguationCard(
-                        fullText: disambiguationWorkingText,
-                        ambiguity: disambiguationQueue[disambiguationIndex],
-                        currentIndex: disambiguationIndex + 1,
-                        total: disambiguationQueue.count,
-                        onPick: { resolveCurrent(with: $0) },
-                        onSkip: { skipCurrent() }
-                    )
-                    .padding(.horizontal, 20)
-                    .padding(.top, 24)
-                    .frame(maxWidth: 540)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                    .zIndex(15)
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                // ── Live equation-check badge — always top-left of the equation ──
+                if let badge = liveCheckBadge {
+                    Group {
+                        switch badge.status {
+                        case .checking:
+                            RingSpinner()
+                        case .correct:
+                            Button { openCheckPanel(for: badge, in: geo.size) } label: {
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 18, weight: .bold))
+                                    .foregroundStyle(liveCheckGreen)
+                            }
+                            .buttonStyle(.plain)
+                        case .incorrect:
+                            Button { openCheckPanel(for: badge, in: geo.size) } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 18, weight: .bold))
+                                    .foregroundStyle(liveCheckRed)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .shadow(color: .black.opacity(0.15), radius: 2, y: 1)
+                    .position(x: badge.anchor.x - 8, y: badge.anchor.y - 8)
+                    .zIndex(7)
+                    .transition(.scale(scale: 0.6).combined(with: .opacity))
                 }
 
                 // ── Box-to-Verify overlay (Gemini Vision) ─────────────────────────
@@ -292,16 +363,21 @@ struct CanvasWorkspace: View {
                 }
             }
             .animation(.spring(response: 0.25, dampingFraction: 0.85), value: menuPos != nil)
-            .animation(.spring(response: 0.3,  dampingFraction: 0.8),  value: holdPos != nil)
             .animation(.easeInOut(duration: 0.28), value: showGraph)
-            .animation(.spring(response: 0.3, dampingFraction: 0.85), value: disambiguationQueue.isEmpty)
-            .animation(.spring(response: 0.3, dampingFraction: 0.85), value: graphDrawerOpen)
             .photosPicker(isPresented: $showPhotoPicker,
                           selection: $pendingPhotoItems,
                           maxSelectionCount: 5,
                           matching: .images)
             .onChange(of: pendingPhotoItems) { _, items in
                 Task { await importPhotos(items, canvasSize: geo.size) }
+            }
+            .onChange(of: requestedGraph) { _, expr in
+                guard let expr else { return }
+                graphEquationText = expr
+                graphExpression = expr
+                graphForce3D = nil
+                recordGraphHistory(expr)
+                withAnimation { showGraph = true }
             }
             .confirmationDialog("Plot as…", isPresented: $showGraphModeChoice, titleVisibility: .visible) {
                 Button("2-D  (y = f(x))")    { startGraph(force3D: false) }
@@ -319,25 +395,42 @@ struct CanvasWorkspace: View {
                     )
                     graphCardWidth = min(540, geo.size.width - 32)
                 }
-                if !show && !graphIsPinned {
+                if !show {
                     graphCardCenter = nil
                 }
             }
+            .onAppear { workspaceSize = geo.size }
+            .onChange(of: geo.size) { _, newSize in workspaceSize = newSize }
         }
-        .inspector(isPresented: $showPanel) {
-            AIResultPanel(
-                recognizedText: $recognizedText,
-                mode: panelMode,
-                unitResult: unitResult,
-                numericResult: numericResult,
-                algebraicResult: algebraicResult,
-                stepReview: stepReview,
-                explanation: explanation,
-                chemistryResult: chemistryResult,
-                isAnalyzing: isAnalyzing,
-                onRerun: rerunAnalysis,
-                onClose: { showPanel = false; isAnalyzing = false; resetPanelState() }
-            )
+        .overlay {
+            if showPanel {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .ignoresSafeArea()
+                    .onTapGesture { showPanel = false; isAnalyzing = false; resetPanelState() }
+                    .zIndex(11)
+            }
+        }
+        .overlay {
+            if showPanel {
+                AIResultPanel(
+                    recognizedText: $recognizedText,
+                    mode: panelMode,
+                    unitResult: unitResult,
+                    numericResult: numericResult,
+                    algebraicResult: algebraicResult,
+                    stepReview: stepReview,
+                    explanation: explanation,
+                    chemistryResult: chemistryResult,
+                    isAnalyzing: isAnalyzing,
+                    onRerun: rerunAnalysis,
+                    onClose: { showPanel = false; isAnalyzing = false; resetPanelState() },
+                    onDrag: dragPanel
+                )
+                .position(panelAnchor)
+                .zIndex(12)
+                .transition(.scale(scale: 0.9).combined(with: .opacity))
+            }
         }
         .onAppear(perform: ensurePage)
     }
@@ -357,101 +450,6 @@ struct CanvasWorkspace: View {
         }
     }
 
-    // MARK: - Left graph drawer
-
-    @ViewBuilder
-    private func graphDrawer(geo: GeometryProxy) -> some View {
-        let drawerW: CGFloat = 330
-        ZStack(alignment: .leading) {
-            // Drawer panel content
-            VStack(spacing: 0) {
-                // Quick-graph type-in field
-                VStack(alignment: .leading, spacing: 8) {
-                    Label("Quick Graph", systemImage: "function")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-
-                    HStack(spacing: 6) {
-                        TextField("e.g. x^2 + sin(x)", text: $drawerTypeExpr)
-                            .font(.system(.body, design: .monospaced))
-                            .autocorrectionDisabled()
-                            .textInputAutocapitalization(.never)
-                            .submitLabel(.go)
-                            .onSubmit { launchDrawerGraph(in: geo) }
-
-                        Button("Plot") { launchDrawerGraph(in: geo) }
-                            .font(.caption.weight(.semibold))
-                            .buttonStyle(.borderedProminent)
-                            .disabled(drawerTypeExpr.trimmingCharacters(in: .whitespaces).isEmpty)
-                    }
-                }
-                .padding(14)
-                .background(Color(.systemGray6))
-
-                Divider()
-
-                // Pinned graph (or placeholder)
-                if graphIsPinned && showGraph {
-                    EquationGraphView(
-                        equationText: graphEquationText,
-                        expression: graphExpression,
-                        forceIs3D: graphForce3D,
-                        isPresented: $showGraph
-                    )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .overlay(alignment: .topTrailing) {
-                        Button {
-                            withAnimation(.spring(response: 0.3)) {
-                                graphIsPinned = false
-                                graphCardCenter = CGPoint(
-                                    x: geo.size.width / 2,
-                                    y: geo.size.height - 260
-                                )
-                            }
-                        } label: {
-                            Image(systemName: "pin.slash")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .padding(8)
-                        }
-                        .buttonStyle(.plain)
-                        .padding(6)
-                    }
-                } else {
-                    ContentUnavailableView {
-                        Label("No Graph", systemImage: "chart.line.uptrend.xyaxis")
-                    } description: {
-                        Text("Type an equation above, or graph from the canvas and tap the pin button.")
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-            }
-            .frame(width: drawerW)
-            .background(.regularMaterial)
-            .offset(x: graphDrawerOpen ? 0 : -drawerW)
-
-            // Arrow tab — always at the right edge of the (possibly hidden) drawer
-            Button {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
-                    graphDrawerOpen.toggle()
-                }
-            } label: {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(.regularMaterial)
-                        .shadow(color: .black.opacity(0.18), radius: 4, x: 2)
-                    Image(systemName: graphDrawerOpen ? "chevron.left" : "chevron.right")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                }
-                .frame(width: 22, height: 52)
-            }
-            .buttonStyle(.plain)
-            .offset(x: graphDrawerOpen ? drawerW : 0)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-    }
-
     // MARK: - Pencil squeeze-to-erase
 
     private func handleSqueezeBegan() {
@@ -467,13 +465,80 @@ struct CanvasWorkspace: View {
         }
     }
 
+    // MARK: - Pen Buttons "Switch Colors" / "Trigger Lasso" actions
+
+    private func handleRequestTool(_ tool: DrawingTool) {
+        activeTool = tool
+    }
+
+    private func handleSwitchColor() {
+        selectedColorTag = (selectedColorTag + 1) % 5
+        let hexes = [pencilHex0, pencilHex1, pencilHex2, pencilHex3, pencilHex4]
+        penColor = PaperTheme.color(fromHex: hexes[selectedColorTag])
+        if activeTool == .eraser || activeTool == .lasso { activeTool = .pen }
+    }
+
+    // MARK: - Radial tool/color palette (Pencil squeeze)
+
+    /// `pos` is in canvas view-space (already converted from content-space
+    /// by PencilCanvasView). Clamped so the arc — which bows down-left from
+    /// this anchor — always stays fully on-screen. Toggles: squeezing again
+    /// while the palette is already showing dismisses it instead of moving it.
+    private func handleShowToolPalette(at pos: CGPoint) {
+        withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+            if radialPaletteAnchor != nil {
+                radialPaletteAnchor = nil
+            } else {
+                let pad = RadialToolMenu.radius + 24
+                let x = pos.x.clamped(to: pad...max(pad, workspaceSize.width - 8))
+                let y = pos.y.clamped(to: 8...max(8, workspaceSize.height - pad))
+                radialPaletteAnchor = CGPoint(x: x, y: y)
+            }
+        }
+    }
+
+    private func applyRadialTool(_ tool: DrawingTool) {
+        activeTool = tool
+        radialPaletteAnchor = nil
+    }
+
+    private func applyRadialColor(_ color: Color) {
+        setPencilHex(PaperTheme.hex(from: color), at: selectedColorTag)
+        penColor = color
+        if activeTool == .eraser || activeTool == .lasso { activeTool = .pen }
+        radialPaletteAnchor = nil
+    }
+
+    private func setPencilHex(_ hex: String, at i: Int) {
+        switch i {
+        case 0: pencilHex0 = hex
+        case 1: pencilHex1 = hex
+        case 2: pencilHex2 = hex
+        case 3: pencilHex3 = hex
+        case 4: pencilHex4 = hex
+        default: break
+        }
+    }
+
     // MARK: - Helpers
 
-    private func clamped(_ pos: CGPoint, in size: CGSize) -> CGPoint {
-        let w: CGFloat = 380, h: CGFloat = 72
+    private func clamped(_ pos: CGPoint, in size: CGSize, boxSize: CGSize = CGSize(width: 380, height: 72)) -> CGPoint {
+        let w = boxSize.width, h = boxSize.height
         return CGPoint(
             x: min(max(pos.x, w / 2 + 12), size.width  - w / 2 - 12),
             y: min(max(pos.y - 50, h / 2 + 12), size.height - h / 2 - 12)
+        )
+    }
+
+    /// Lets the user drag the floating AIResultPanel anywhere on the workspace,
+    /// clamped so its grabber stays reachable near the edges.
+    private func dragPanel(by delta: CGSize) {
+        let halfW: CGFloat = 210, halfH: CGFloat = 260
+        let maxX = max(halfW, workspaceSize.width - halfW)
+        let maxY = max(halfH, workspaceSize.height - halfH)
+        panelAnchor = CGPoint(
+            x: (panelAnchor.x + delta.width).clamped(to: halfW...maxX),
+            y: (panelAnchor.y + delta.height).clamped(to: halfH...maxY)
         )
     }
 
@@ -495,62 +560,7 @@ struct CanvasWorkspace: View {
         return result
     }
 
-    // MARK: - Disambiguation resolution
-
-    private func resolveCurrent(with correctionText: String) {
-        guard disambiguationIndex < disambiguationQueue.count else { return }
-        let current = disambiguationQueue[disambiguationIndex]
-
-        disambiguationWorkingText = disambiguationWorkingText
-            .replacingOccurrences(of: current.ocrFragment, with: correctionText)
-
-        if correctionText != current.ocrFragment {
-            let snippet = String(disambiguationWorkingText.prefix(40))
-            let entry = HandwritingCorrection(
-                ocrFragment: current.ocrFragment,
-                correctedFragment: correctionText,
-                exampleContext: snippet
-            )
-            modelContext.insert(entry)
-        }
-
-        advanceOrFinalize()
-    }
-
-    private func skipCurrent() {
-        advanceOrFinalize()
-    }
-
-    private func advanceOrFinalize() {
-        let next = disambiguationIndex + 1
-        if next < disambiguationQueue.count {
-            withAnimation(.spring(response: 0.25)) { disambiguationIndex = next }
-        } else {
-            finalizeAction()
-        }
-    }
-
-    private func finalizeAction() {
-        let text   = disambiguationWorkingText
-        let action = pendingCanvasAction
-        withAnimation {
-            disambiguationQueue = []
-            disambiguationIndex = 0
-        }
-        pendingCanvasAction = nil
-
-        Task {
-            switch action {
-            case .graph:     await continueGraph(with: text)
-            case .check:     await continueCheck(with: text)
-            case .chemistry: await continueChemistry(with: text)
-            case .ai:        await continueAI(with: text)
-            case nil:        break
-            }
-        }
-    }
-
-    // MARK: - Long-press action handlers (with disambiguation gate)
+    // MARK: - Quick-action handlers (double-tap menu — straight to the AI call)
 
     private func handleGraph() {
         guard let image = menuImage else { menuPos = nil; return }
@@ -566,15 +576,7 @@ struct CanvasWorkspace: View {
         Task {
             let rawOCR    = await EquationOCR.recognize(in: image)
             let corrected = applyStoredCorrections(rawOCR)
-            let ambiguities = await reviewService.findAmbiguities(in: corrected)
-            if !ambiguities.isEmpty {
-                disambiguationWorkingText = corrected
-                disambiguationQueue       = ambiguities
-                disambiguationIndex       = 0
-                pendingCanvasAction       = .graph
-            } else {
-                await continueGraph(with: corrected)
-            }
+            await continueGraph(with: corrected)
         }
     }
 
@@ -583,20 +585,18 @@ struct CanvasWorkspace: View {
         let expr   = aiExpr ?? MathEvaluator.extractExpression(from: text) ?? text
         graphEquationText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         graphExpression   = expr
+        recordGraphHistory(expr)
         withAnimation { showGraph = true }
     }
 
-    /// Type-in graph from the drawer panel.
-    private func launchDrawerGraph(in geo: GeometryProxy) {
-        let expr = drawerTypeExpr.trimmingCharacters(in: .whitespaces)
-        guard !expr.isEmpty else { return }
-        graphEquationText = expr
-        graphExpression   = expr
-        graphForce3D      = nil
-        graphIsPinned     = true
-        graphDrawerOpen   = true
-        withAnimation { showGraph = true }
+    /// Appends `expr` to this note's graph history (skipping consecutive
+    /// duplicates), surfaced in the notebook side panel's Graphs tab.
+    private func recordGraphHistory(_ expr: String) {
+        let trimmed = expr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, notepad.graphHistory.last != trimmed else { return }
+        notepad.graphHistory.append(trimmed)
     }
+
 
     private func handleChemistry() {
         guard let image = menuImage else { menuPos = nil; return }
@@ -608,16 +608,7 @@ struct CanvasWorkspace: View {
         Task {
             let rawOCR    = await EquationOCR.recognize(in: image)
             let corrected = applyStoredCorrections(rawOCR)
-            recognizedText = corrected
-            let ambiguities = await reviewService.findAmbiguities(in: corrected)
-            if !ambiguities.isEmpty {
-                disambiguationWorkingText = corrected
-                disambiguationQueue = ambiguities
-                disambiguationIndex = 0
-                pendingCanvasAction = .chemistry
-            } else {
-                await continueChemistry(with: corrected)
-            }
+            await continueChemistry(with: corrected)
         }
     }
 
@@ -628,27 +619,51 @@ struct CanvasWorkspace: View {
         isAnalyzing = false
     }
 
-    private func handleUnits() {
-        guard let image = menuImage else { menuPos = nil; return }
-        menuPos = nil; menuImage = nil
+    // MARK: - Live equation checking
+
+    /// Called by PencilCanvasView ~1s after the user stops writing near
+    /// `pos`. OCR's that region and shows a check/X badge — no confirmation
+    /// step, since this runs silently in the background rather than
+    /// interrupting the user like the double-tap menu actions do.
+    private func handleLiveCheck(at pos: CGPoint, image: UIImage) {
+        liveCheckGeneration += 1
+        let generation = liveCheckGeneration
+        withAnimation(.easeIn(duration: 0.15)) {
+            liveCheckBadge = LiveCheckBadge(anchor: pos, status: .checking)
+        }
+        Task {
+            let rawOCR = await EquationOCR.recognize(in: image)
+            let corrected = applyStoredCorrections(rawOCR)
+            guard generation == liveCheckGeneration else { return }
+            guard !corrected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                withAnimation { liveCheckBadge = nil }
+                return
+            }
+            let result = await reviewService.checkAlgebra(problem: corrected)
+            guard generation == liveCheckGeneration else { return }
+            let status: LiveCheckBadge.Status
+            switch result.state {
+            case .correct:   status = .correct
+            case .hasErrors: status = .incorrect
+            case .modelUnavailable, .skipped, .failed:
+                withAnimation { liveCheckBadge = nil }
+                return
+            }
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                liveCheckBadge = LiveCheckBadge(anchor: pos, status: status, recognizedText: corrected)
+            }
+        }
+    }
+
+    /// Tapping a live-check badge opens the full floating panel for a deeper look.
+    private func openCheckPanel(for badge: LiveCheckBadge, in size: CGSize) {
+        liveCheckBadge = nil
         panelMode = .check
         showPanel = true
         isAnalyzing = true
         resetPanelState()
-        Task {
-            let rawOCR    = await EquationOCR.recognize(in: image)
-            let corrected = applyStoredCorrections(rawOCR)
-            recognizedText = corrected
-            let ambiguities = await reviewService.findAmbiguities(in: corrected)
-            if !ambiguities.isEmpty {
-                disambiguationWorkingText = corrected
-                disambiguationQueue = ambiguities
-                disambiguationIndex = 0
-                pendingCanvasAction = .check
-            } else {
-                await continueCheck(with: corrected)
-            }
-        }
+        panelAnchor = clamped(badge.anchor, in: size, boxSize: CGSize(width: 420, height: 520))
+        Task { await continueCheck(with: badge.recognizedText) }
     }
 
     private func continueCheck(with text: String) async {
@@ -697,7 +712,7 @@ struct CanvasWorkspace: View {
 
     private func continueAI(with text: String) async {
         recognizedText = text
-        async let aiResult = reviewService.explain(problem: text)
+        async let aiResult = aiVerbose ? reviewService.explain(problem: text) : reviewService.review(equation: text)
         let unitRes = UnitChecker.check(text)
         let ai = await aiResult
         explanation = ai
@@ -842,9 +857,8 @@ private struct PhotoCardView: View {
 
 // MARK: - Long Press Context Menu
 
-private struct LongPressMenu: View {
+private struct QuickActionMenu: View {
     let onGraph: () -> Void
-    let onUnits: () -> Void
     let onChemistry: () -> Void
     let onAI: () -> Void
 
@@ -852,14 +866,12 @@ private struct LongPressMenu: View {
         HStack(spacing: 0) {
             pillItem(icon: "chart.line.uptrend.xyaxis", label: "Graph",   action: onGraph)
             divider
-            pillItem(icon: "checkmark.seal",             label: "Check",   action: onUnits)
-            divider
             pillItem(icon: "atom",                       label: "Chem",    action: onChemistry)
             divider
             pillItem(icon: "sparkles",                   label: "AI Help", action: onAI)
         }
-        .background(.regularMaterial, in: Capsule())
-        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.5))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.5))
         .shadow(color: .black.opacity(0.2), radius: 18, y: 5)
     }
 
@@ -895,7 +907,7 @@ private struct RulerBar: View {
                 .frame(height: 1.5)
             HStack {
                 ZStack {
-                    Capsule()
+                    RoundedRectangle(cornerRadius: 7)
                         .fill(Color.blue.opacity(0.18))
                         .frame(width: 30, height: 22)
                     Image(systemName: "arrow.up.and.down")

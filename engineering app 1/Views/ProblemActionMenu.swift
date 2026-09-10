@@ -61,8 +61,8 @@ struct ProblemActionMenu: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(.regularMaterial, in: Capsule())
-        .overlay(Capsule().strokeBorder(.quaternary, lineWidth: 1))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.quaternary, lineWidth: 1))
         .shadow(color: Color.black.opacity(0.12), radius: 8, x: 0, y: 4)
     }
 

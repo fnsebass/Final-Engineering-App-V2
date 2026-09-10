@@ -4,9 +4,16 @@
 //
 //  Custom two-row header:
 //    Row 1 — mode tabs: Math (grid paper) | English (lined) | Draw (blank)
-//    Row 2 — back · title · pencil tips · tools · ruler · settings
+//    Row 2 — home · toggle sidebar · title · pencil tips · tools · ruler · settings
 //
-//  Pencil tips: tap to select, long-press to open a color picker for that slot.
+//  Home always returns to HomeView's top-level Home screen (not just back to
+//  the enclosing book); the notebook side panel (ChapterSidebarView) is
+//  always available while a note is open, so "back to this book's chapters"
+//  is just a look at the sidebar rather than a separate nav action.
+//
+//  Pencil tips: tap to select, double-tap to open a color picker for that
+//  slot, long-press to open a curved tool/color palette (RadialToolMenu) —
+//  eraser/highlighter/line/shape on top, a scrollable strip of colors below.
 //  Colors per slot persist for the session and update live if the slot is active.
 //  Drawing state (activeTool, penColor, rulerActive) lives here so the toolbar
 //  and the canvas share it through bindings.
@@ -14,6 +21,9 @@
 
 import SwiftUI
 import SwiftData
+#if os(iOS)
+import PencilKit
+#endif
 
 // MARK: - Color ↔ hex helpers (iOS only, private to this file)
 #if os(iOS)
@@ -36,7 +46,10 @@ private extension Color {
 
 struct NotepadEditorView: View {
     @Bindable var notepad: Notepad
-    var onBack: () -> Void = {}
+    var onHome: () -> Void = {}
+    var onToggleSidebar: () -> Void = {}
+    var onUndoManagerReady: (UndoManager?) -> Void = { _ in }
+    var requestedGraph: String? = nil
 
     @State private var showSettings = false
     @State private var isEditingTitle = false
@@ -58,7 +71,7 @@ struct NotepadEditorView: View {
     @AppStorage("pencilSlot3") private var pencilHex3: String = "#127038"  // PCB Green
     @AppStorage("pencilSlot4") private var pencilHex4: String = "#BD1414"  // Warning Red
 
-    // Long-press color-picker state
+    // Double-tap color-picker state
     @State private var longPressedPencilIndex: Int? = nil
     @State private var pickerColor: Color = .black
 
@@ -74,6 +87,11 @@ struct NotepadEditorView: View {
 
     // Photo import (trigger passed down to CanvasWorkspace)
     @State private var showPhotoPicker = false
+
+    // Export (Settings → General → Default Export Format)
+    @AppStorage(GeneralPrefs.defaultExportFormat) private var exportFormatRaw = ExportFormat.pdf.rawValue
+    @State private var exportedFileURL: URL? = nil
+    @State private var showExportShare = false
     #endif
 
     var body: some View {
@@ -88,6 +106,11 @@ struct NotepadEditorView: View {
             .onChange(of: notepad.paperColorHex) { _, _ in syncPenColorToBackground() }
             .toolbar(.hidden, for: .navigationBar)
             .safeAreaInset(edge: .top, spacing: 0) { headerBar }
+            .sheet(isPresented: $showExportShare) {
+                if let url = exportedFileURL {
+                    ActivityView(activityItems: [url])
+                }
+            }
             #endif
     }
 
@@ -139,7 +162,9 @@ struct NotepadEditorView: View {
             rulerActive: $rulerActive,
             isVerifyMode: $isVerifyMode,
             showPhotoPicker: $showPhotoPicker,
-            activeShapeKind: activeShapeKind
+            activeShapeKind: activeShapeKind,
+            onUndoManagerReady: onUndoManagerReady,
+            requestedGraph: requestedGraph
         )
         #else
         ContentUnavailableView {
@@ -189,25 +214,46 @@ struct NotepadEditorView: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: Tool row  (back · title · pencil tips · tools · ruler · settings)
+    // MARK: Tool row  (home · sidebar · title · pencil tips · tools · ruler · settings)
 
+    // Fixed layout: home/sidebar-toggle/title always sit on the left, the
+    // pencil/tool palette always on the right.
     private var toolRow: some View {
         HStack(spacing: 0) {
-            // ── Back ─────────────────────────────────────────
-            Button(action: onBack) {
-                Image(systemName: "chevron.left")
+            leadingCluster
+            Spacer(minLength: 6)
+            trailingCluster
+        }
+        .frame(height: 44)
+    }
+
+    // ── Home · toggle sidebar · title ─────────────────────────
+    private var leadingCluster: some View {
+        HStack(spacing: 0) {
+            Button(action: onHome) {
+                Image(systemName: "house")
                     .font(.system(size: 15, weight: .semibold))
                     .frame(width: 40, height: 44)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
-            // ── Title ─────────────────────────────────────────
+            Button(action: onToggleSidebar) {
+                Image(systemName: "sidebar.left")
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 40, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
             titleControl
+        }
+    }
 
-            Spacer(minLength: 6)
-
-            // ── Pencil tips (tap = select, long-press = recolor) ──
+    // ── Pencil tips · drawing tools · shape · photo · ruler · calculator · verify · export · settings ──
+    private var trailingCluster: some View {
+        HStack(spacing: 0) {
+            // ── Pencil tips (tap = select, double-tap = recolor) ──
             HStack(spacing: 3) {
                 ForEach(0..<5, id: \.self) { i in
                     let isDrawingMode = activeTool == .pen
@@ -225,10 +271,12 @@ struct NotepadEditorView: View {
                                 activeTool = .pen
                             }
                         }
-                        .onLongPressGesture(minimumDuration: 0.45) {
-                            pickerColor = pencilColor(at: i)
-                            longPressedPencilIndex = i
-                        }
+                        .simultaneousGesture(
+                            TapGesture(count: 2).onEnded {
+                                pickerColor = pencilColor(at: i)
+                                longPressedPencilIndex = i
+                            }
+                        )
                         .popover(isPresented: Binding(
                             get: { longPressedPencilIndex == i },
                             set: { if !$0 { longPressedPencilIndex = nil } }
@@ -296,6 +344,15 @@ struct NotepadEditorView: View {
             }
             .buttonStyle(.plain)
 
+            // ── Export ────────────────────────────────────────
+            Button { exportNotepad() } label: {
+                Image(systemName: "square.and.arrow.up")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(Color.secondary)
+                    .frame(width: 32, height: 32)
+            }
+            .buttonStyle(.plain)
+
             rowDivider
 
             // ── Settings ──────────────────────────────────────
@@ -310,7 +367,6 @@ struct NotepadEditorView: View {
                 NotepadSettingsView(notepad: notepad)
             }
         }
-        .frame(height: 44)
     }
 
     // MARK: Pencil color-picker popover
@@ -376,6 +432,46 @@ struct NotepadEditorView: View {
         isEditingTitle = false
     }
 
+    // MARK: Export (Settings → General → Default Export Format)
+
+    private func exportNotepad() {
+        guard let page = notepad.orderedPages.first else { return }
+        let drawing = page.drawingData.isEmpty
+            ? PKDrawing()
+            : (try? PKDrawing(data: page.drawingData)) ?? PKDrawing()
+
+        let bounds = drawing.bounds.isEmpty
+            ? CGRect(x: 0, y: 0, width: 1000, height: 1400)
+            : drawing.bounds.insetBy(dx: -20, dy: -20)
+        let image = drawing.image(from: bounds, scale: 2)
+        let fileName = notepad.title.isEmpty ? "Notepad" : notepad.title
+        let format = ExportFormat(rawValue: exportFormatRaw) ?? .pdf
+
+        do {
+            let url: URL
+            switch format {
+            case .pdf:
+                url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(fileName).appendingPathExtension("pdf")
+                let renderer = UIGraphicsPDFRenderer(bounds: CGRect(origin: .zero, size: bounds.size))
+                let data = renderer.pdfData { ctx in
+                    ctx.beginPage()
+                    image.draw(in: CGRect(origin: .zero, size: bounds.size))
+                }
+                try data.write(to: url, options: .atomic)
+            case .png:
+                url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(fileName).appendingPathExtension("png")
+                guard let data = image.pngData() else { return }
+                try data.write(to: url, options: .atomic)
+            }
+            exportedFileURL = url
+            showExportShare = true
+        } catch {
+            // Best-effort export; if writing the temp file fails there's nothing to share.
+        }
+    }
+
     // MARK: Reusable sub-views
 
     private var rowDivider: some View {
@@ -438,6 +534,20 @@ struct NotepadEditorView: View {
     }
     #endif
 }
+
+// MARK: - Export share sheet
+
+#if os(iOS)
+private struct ActivityView: UIViewControllerRepresentable {
+    let activityItems: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+#endif
 
 // MARK: - Pencil Tip View + Shapes
 

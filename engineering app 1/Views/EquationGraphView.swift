@@ -82,6 +82,9 @@ struct EquationGraphView: View {
         VStack(spacing: 0) {
             header
             expressionRow
+            FunctionKeyboardStrip(keys: FunctionKeyboardStrip.trigDefaults) { key in
+                editExpr += key
+            }
             Divider()
             if editExpr.trimmingCharacters(in: .whitespaces).isEmpty {
                 emptyPrompt

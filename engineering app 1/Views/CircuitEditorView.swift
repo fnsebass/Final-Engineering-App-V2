@@ -2,11 +2,23 @@
 //  CircuitEditorView.swift
 //  Tolerance
 //
-//  Full-screen circuit diagram editor on a blank (no-grid) white canvas.
-//  Modes: select · wire · erase · place<type>
+//  Full-screen circuit diagram editor. Modes: select · wire · erase · place<type>
 //  Toolbar is compact (icon-only palette, 36 pt height) to maximise canvas space.
-//  Generated circuits are placed at the centre of the visible viewport and the
-//  scroll position is reset so they appear exactly centred on screen.
+//  All 9 component types (resistor, battery, capacitor, inductor, LED, switch,
+//  ground, voltmeter, ammeter) are placeable from the palette.
+//
+//  The canvas is a fixed size matching the viewport (like TrussEditorView) —
+//  NOT wrapped in a ScrollView. A ScrollView's own pan recognizer competes
+//  with the tap-to-place DragGesture(minimumDistance: 0) below for every
+//  single-finger touch, and unpredictably "wins" some of the time, which is
+//  why placement used to fail intermittently. Matching Truss's approach
+//  (no scrolling container at all) removes that conflict entirely.
+//
+//  Every placed/moved component and every wire endpoint snaps to a fixed
+//  grid (`gridSize`), chosen so a component's leads (at ±44 from center)
+//  land exactly on neighboring grid points too — wires between adjacent
+//  components always connect cleanly. AI-generated circuits are unaffected
+//  (their layout math uses its own precise offsets).
 //
 
 #if os(iOS)
@@ -21,6 +33,13 @@ private enum CircuitEditorMode: Equatable {
     case place(CircuitComponentType)
     case wire
     case erase
+}
+
+/// A wire's share of the battery's total current, computed in
+/// buildFlowDirections(). See that function's doc comment for the model.
+private struct WireFlow {
+    let forward: Bool
+    let share: Double
 }
 
 // MARK: - @Generable types for AI circuit generation
@@ -79,10 +98,8 @@ struct CircuitEditorView: View {
     @State private var wireAnchor: CGPoint? = nil
     @State private var wireTip:    CGPoint? = nil
 
-    // Viewport size captured by GeometryReader (used for centred generation)
-    @State private var viewportSize: CGSize = CGSize(width: 800, height: 600)
-    // Non-nil after generation so ScrollViewReader can scroll to it
-    @State private var generatedAnchor: CGPoint? = nil
+    // Canvas size — matches the viewport exactly (no scrolling container).
+    @State private var canvasSize: CGSize = CGSize(width: 800, height: 600)
 
     // Value editor
     @State private var showValueEditor = false
@@ -96,7 +113,11 @@ struct CircuitEditorView: View {
 
     // Animation
     @State private var isAnimating = false
-    @State private var wireFlow: [UUID: Bool] = [:]  // true = start→end, false = end→start
+    // Per-wire current: `forward` = true means flow runs start→end; `share`
+    // is that wire's fraction of the battery's total current (1.0 = carries
+    // it all, as on a plain series run; less on a parallel branch). A wire
+    // absent from this dict isn't on any live + → − path and never animates.
+    @State private var wireFlow: [UUID: WireFlow] = [:]
 
     // Setup sheet (shown on first open when canvas is empty)
     @State private var showSetup    = false
@@ -106,8 +127,14 @@ struct CircuitEditorView: View {
 
     private enum SetupPhase { case choice, aiInput }
 
-    private let canvasW: CGFloat = 3000
-    private let canvasH: CGFloat = 2000
+    // Chosen so a component's leads (±44 from its center) land on neighboring
+    // grid points too, so wires between adjacent components connect cleanly.
+    private let gridSize: CGFloat = 44
+
+    private func snapToGrid(_ p: CGPoint) -> CGPoint {
+        CGPoint(x: (p.x / gridSize).rounded() * gridSize,
+                y: (p.y / gridSize).rounded() * gridSize)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -216,7 +243,7 @@ struct CircuitEditorView: View {
                     .foregroundStyle(isAnimating ? Color.yellow : Color.secondary)
                     .padding(.horizontal, 8)
                     .frame(height: 26)
-                    .background(isAnimating ? Color.yellow.opacity(0.18) : Color.clear, in: Capsule())
+                    .background(isAnimating ? Color.yellow.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 4)
@@ -230,7 +257,7 @@ struct CircuitEditorView: View {
                     .foregroundStyle(.purple)
                     .padding(.horizontal, 8)
                     .frame(height: 26)
-                    .background(Color.purple.opacity(0.12), in: Capsule())
+                    .background(Color.purple.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 5)
@@ -276,161 +303,160 @@ struct CircuitEditorView: View {
     // MARK: - Canvas
 
     private var circuitCanvas: some View {
-        ScrollViewReader { proxy in
-            ScrollView([.horizontal, .vertical], showsIndicators: false) {
-                    ZStack(alignment: .topLeading) {
+        ZStack(alignment: .topLeading) {
 
-                        // Background: place / deselect / wire-draw / erase-wire
-                        Color(red: 0.07, green: 0.08, blue: 0.10)
-                            .frame(width: canvasW, height: canvasH)
-                            .contentShape(Rectangle())
-                            .gesture(
-                                DragGesture(minimumDistance: 0)
-                                    .onChanged { v in
-                                        guard case .wire = mode else { return }
-                                        if wireAnchor == nil { wireAnchor = v.startLocation }
-                                        wireTip = v.location
-                                    }
-                                    .onEnded { v in
-                                        let dist = hypot(v.translation.width, v.translation.height)
-                                        switch mode {
-                                        case .select:
-                                            if dist < 6 { selectedID = nil }
-                                        case .place(let type):
-                                            addComponent(type, at: v.startLocation)
-                                            mode = .select
-                                        case .wire:
-                                            if dist > 6, let anchor = wireAnchor {
-                                                wires.append(CircuitWire(
-                                                    start: CircuitPoint(anchor),
-                                                    end:   CircuitPoint(v.location)
-                                                ))
-                                                saveChanges()
-                                            }
-                                            wireAnchor = nil; wireTip = nil
-                                        case .erase:
-                                            if dist < 20 {
-                                                eraseNearestWire(at: v.startLocation)
-                                            }
-                                        }
-                                    }
-                            )
-
-                        // Wires + preview
-                        Canvas { ctx, size in
-                            // Committed wires
-                            var path = Path()
-                            for w in wires {
-                                path.move(to: w.start.cgPoint)
-                                path.addLine(to: w.end.cgPoint)
-                            }
-                            ctx.stroke(path, with: .color(.white),
-                                       style: StrokeStyle(lineWidth: 2, lineCap: .round))
-
-                            // Live wire preview
-                            if let anchor = wireAnchor, let tip = wireTip {
-                                var preview = Path()
-                                preview.move(to: anchor)
-                                preview.addLine(to: tip)
-                                ctx.stroke(preview, with: .color(.blue.opacity(0.7)),
-                                           style: StrokeStyle(lineWidth: 2, lineCap: .round,
-                                                              dash: [8, 4]))
-                            }
+            // Background: place / deselect / wire-draw / erase-wire
+            Color(red: 0.07, green: 0.08, blue: 0.10)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { v in
+                            guard case .wire = mode else { return }
+                            if wireAnchor == nil { wireAnchor = snapToGrid(v.startLocation) }
+                            wireTip = snapToGrid(v.location)
                         }
-                        .frame(width: canvasW, height: canvasH)
-                        .allowsHitTesting(false)
-
-                        // Current-flow animation overlay
-                        if isAnimating {
-                            TimelineView(.animation) { tl in
-                                Canvas { ctx, _ in
-                                    let t = tl.date.timeIntervalSinceReferenceDate
-                                    for wire in wires {
-                                        // Respect current-flow direction so all dots move one way
-                                        let forward = wireFlow[wire.id] ?? true
-                                        let a = forward ? wire.start.cgPoint : wire.end.cgPoint
-                                        let b = forward ? wire.end.cgPoint   : wire.start.cgPoint
-                                        let len = hypot(b.x - a.x, b.y - a.y)
-                                        guard len > 8 else { continue }
-                                        let speed = animSpeed(near: wire)
-                                        let spacing: CGFloat = 22
-                                        let phase = CGFloat(t * speed * 55)
-                                            .truncatingRemainder(dividingBy: spacing)
-                                        var d = phase
-                                        while d < len {
-                                            let frac = d / len
-                                            let px = a.x + (b.x - a.x) * frac
-                                            let py = a.y + (b.y - a.y) * frac
-                                            let r: CGFloat = speed > 1.5 ? 4 : speed < 0.5 ? 2 : 3
-                                            ctx.fill(
-                                                Path(ellipseIn: CGRect(x: px-r, y: py-r,
-                                                                       width: r*2, height: r*2)),
-                                                with: .color(Color.yellow.opacity(0.9))
-                                            )
-                                            d += spacing
-                                        }
-                                    }
+                        .onEnded { v in
+                            let dist = hypot(v.translation.width, v.translation.height)
+                            switch mode {
+                            case .select:
+                                if dist < 6 { selectedID = nil }
+                            case .place(let type):
+                                addComponent(type, at: v.startLocation)
+                                mode = .select
+                            case .wire:
+                                // Either a real drag (dist > 6, the original
+                                // press-drag-release flow) or a plain tap that
+                                // lands meaningfully away from an anchor already
+                                // pending from a terminal-circle tap — so tapping
+                                // terminal A then tapping terminal B (or any grid
+                                // point) also completes a wire, not just dragging.
+                                let endPoint = snapToGrid(v.location)
+                                if let anchor = wireAnchor,
+                                   dist > 6 || hypot(anchor.x - endPoint.x, anchor.y - endPoint.y) > 4 {
+                                    wires.append(CircuitWire(
+                                        start: CircuitPoint(anchor),
+                                        end:   CircuitPoint(endPoint)
+                                    ))
+                                    saveChanges()
                                 }
-                                .frame(width: canvasW, height: canvasH)
-                                .allowsHitTesting(false)
+                                wireAnchor = nil; wireTip = nil
+                            case .erase:
+                                if dist < 20 {
+                                    eraseNearestWire(at: v.startLocation)
+                                }
                             }
                         }
+                )
 
-                        // Components
-                        ForEach(components) { comp in
-                            CircuitSymbolView(component: comp, isSelected: selectedID == comp.id)
-                                .position(comp.position)
-                                .gesture(
-                                    DragGesture(minimumDistance: 4)
-                                        .onChanged { v in
-                                            guard case .select = mode else { return }
-                                            moveComponent(id: comp.id, to: v.location)
-                                        }
-                                        .onEnded { _ in saveChanges() }
+            // Wires + preview
+            Canvas { ctx, size in
+                // Committed wires
+                var path = Path()
+                for w in wires {
+                    path.move(to: w.start.cgPoint)
+                    path.addLine(to: w.end.cgPoint)
+                }
+                ctx.stroke(path, with: .color(.white),
+                           style: StrokeStyle(lineWidth: 2, lineCap: .round))
+
+                // Live wire preview
+                if let anchor = wireAnchor, let tip = wireTip {
+                    var preview = Path()
+                    preview.move(to: anchor)
+                    preview.addLine(to: tip)
+                    ctx.stroke(preview, with: .color(.blue.opacity(0.7)),
+                               style: StrokeStyle(lineWidth: 2, lineCap: .round,
+                                                  dash: [8, 4]))
+                }
+            }
+            .allowsHitTesting(false)
+
+            // Current-flow animation overlay
+            if isAnimating {
+                TimelineView(.animation) { tl in
+                    Canvas { ctx, _ in
+                        let t = tl.date.timeIntervalSinceReferenceDate
+                        for wire in wires {
+                            // Only wires on a live + → − path have an entry here; skip
+                            // everything else so a disconnected negative terminal, a
+                            // dead-end branch, or a capacitor-blocked loop never animates.
+                            guard let flow = wireFlow[wire.id] else { continue }
+                            let a = flow.forward ? wire.start.cgPoint : wire.end.cgPoint
+                            let b = flow.forward ? wire.end.cgPoint   : wire.start.cgPoint
+                            let len = hypot(b.x - a.x, b.y - a.y)
+                            guard len > 8 else { continue }
+                            // Denser, faster, brighter dots for a bigger share of the
+                            // total current — a trunk before a parallel split (share
+                            // ≈ 1) reads very differently from a losing branch (share
+                            // close to 0), and every wire in a plain series run shares
+                            // the same value, so they all animate identically.
+                            let share = min(flow.share, 1.0)
+                            let speed = 0.4 + 1.8 * share
+                            let spacing: CGFloat = max(10, 26 - 14 * CGFloat(share))
+                            let phase = CGFloat(t * speed * 55)
+                                .truncatingRemainder(dividingBy: spacing)
+                            var d = phase
+                            while d < len {
+                                let frac = d / len
+                                let px = a.x + (b.x - a.x) * frac
+                                let py = a.y + (b.y - a.y) * frac
+                                let r: CGFloat = 2 + 2 * CGFloat(share)
+                                ctx.fill(
+                                    Path(ellipseIn: CGRect(x: px-r, y: py-r,
+                                                           width: r*2, height: r*2)),
+                                    with: .color(Color.yellow.opacity(0.55 + 0.35 * share))
                                 )
-                                .onTapGesture {
-                                    if case .erase = mode {
-                                        components.removeAll { $0.id == comp.id }
-                                        if selectedID == comp.id { selectedID = nil }
-                                        saveChanges()
-                                    } else {
-                                        withAnimation(.spring(response: 0.2)) {
-                                            if selectedID == comp.id && comp.type.hasValue {
-                                                editingComp = comp
-                                                valueText = comp.value.map {
-                                                    $0 == $0.rounded() && abs($0) < 1e6
-                                                        ? "\(Int($0))" : String(format: "%.4g", $0)
-                                                } ?? ""
-                                                showValueEditor = true
-                                            } else {
-                                                selectedID = comp.id == selectedID ? nil : comp.id
-                                            }
-                                        }
-                                    }
-                                }
+                                d += spacing
+                            }
                         }
+                    }
+                    .allowsHitTesting(false)
+                }
+            }
 
-                        // Invisible scroll-to anchor after AI generation
-                        if let anchor = generatedAnchor {
-                            Color.clear
-                                .frame(width: 1, height: 1)
-                                .id("generatedAnchor")
-                                .position(anchor)
+            // Components
+            ForEach(components) { comp in
+                CircuitSymbolView(
+                    component: comp,
+                    isSelected: selectedID == comp.id,
+                    isWireMode: mode == .wire,
+                    onTerminalTap: { isFirst in handleTerminalTap(on: comp, isFirst: isFirst) }
+                )
+                    .position(comp.position)
+                    .gesture(
+                        DragGesture(minimumDistance: 4)
+                            .onChanged { v in
+                                guard case .select = mode else { return }
+                                moveComponent(id: comp.id, to: v.location)
+                            }
+                            .onEnded { _ in saveChanges() }
+                    )
+                    .onTapGesture {
+                        if case .erase = mode {
+                            components.removeAll { $0.id == comp.id }
+                            if selectedID == comp.id { selectedID = nil }
+                            saveChanges()
+                        } else {
+                            withAnimation(.spring(response: 0.2)) {
+                                if selectedID == comp.id && comp.type.hasValue {
+                                    editingComp = comp
+                                    valueText = comp.value.map {
+                                        $0 == $0.rounded() && abs($0) < 1e6
+                                            ? "\(Int($0))" : String(format: "%.4g", $0)
+                                    } ?? ""
+                                    showValueEditor = true
+                                } else {
+                                    selectedID = comp.id == selectedID ? nil : comp.id
+                                }
+                            }
                         }
                     }
-                }
-                .background(Color(red: 0.07, green: 0.08, blue: 0.10))
-                .environment(\.colorScheme, .dark)
-                .onGeometryChange(for: CGSize.self) { $0.size } action: { viewportSize = $0 }
-                .onChange(of: generatedAnchor) { _, pt in
-                    guard pt != nil else { return }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                        withAnimation(.easeInOut(duration: 0.4)) {
-                            proxy.scrollTo("generatedAnchor", anchor: .center)
-                        }
-                    }
-                }
+            }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(red: 0.07, green: 0.08, blue: 0.10))
+        .environment(\.colorScheme, .dark)
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { canvasSize = $0 }
     }
 
     // MARK: - Setup sheet
@@ -647,8 +673,9 @@ struct CircuitEditorView: View {
     }
 
     private func addComponent(_ type: CircuitComponentType, at pt: CGPoint) {
+        let snapped = snapToGrid(pt)
         var comp = CircuitComponent(type: type,
-                                   x: Double(pt.x), y: Double(pt.y),
+                                   x: Double(snapped.x), y: Double(snapped.y),
                                    label: nextLabel(for: type))
         if type == .battery  { comp.value = 9 }
         if type == .resistor { comp.value = 100 }
@@ -659,8 +686,41 @@ struct CircuitEditorView: View {
 
     private func moveComponent(id: UUID, to pt: CGPoint) {
         guard let i = components.firstIndex(where: { $0.id == id }) else { return }
-        components[i].x = Double(pt.x)
-        components[i].y = Double(pt.y)
+        let snapped = snapToGrid(pt)
+        components[i].x = Double(snapped.x)
+        components[i].y = Double(snapped.y)
+    }
+
+    /// A component's lead position in canvas space — same ±44/rotation math
+    /// the electrical model in buildFlowDirections already uses, so a wire
+    /// started here lines up exactly with what the current-flow analysis expects.
+    private func terminalPoint(of comp: CircuitComponent, isFirst: Bool) -> CGPoint {
+        if comp.type == .ground {
+            let crad = comp.rotation * .pi / 180
+            return CGPoint(x: comp.x + 16 * sin(crad), y: comp.y - 16 * cos(crad))
+        }
+        let crad = comp.rotation * .pi / 180
+        let sign: Double = isFirst ? -1 : 1
+        return CGPoint(x: comp.x + sign * 44 * cos(crad), y: comp.y + sign * 44 * sin(crad))
+    }
+
+    /// Tapping a component's terminal circle to connect a wire — the same
+    /// tap-tap chaining TrussEditorView uses for its nodes: first tap sets
+    /// the pending anchor (and shows the live dashed preview), second tap
+    /// (anywhere — another terminal or a plain grid point) commits the wire.
+    private func handleTerminalTap(on comp: CircuitComponent, isFirst: Bool) {
+        guard case .wire = mode else { return }
+        let point = terminalPoint(of: comp, isFirst: isFirst)
+        if let anchor = wireAnchor {
+            if hypot(anchor.x - point.x, anchor.y - point.y) > 4 {
+                wires.append(CircuitWire(start: CircuitPoint(anchor), end: CircuitPoint(point)))
+                saveChanges()
+            }
+            wireAnchor = nil; wireTip = nil
+        } else {
+            wireAnchor = point
+            wireTip = point
+        }
     }
 
     private func eraseNearestWire(at point: CGPoint) {
@@ -779,8 +839,8 @@ struct CircuitEditorView: View {
     // Place components centred in the visible viewport, supporting series and parallel topologies.
     private func placeGeneratedCircuit(_ items: [GeneratedCircuitItem]) {
         guard !items.isEmpty else { return }
-        let cx = viewportSize.width  / 2
-        let cy = viewportSize.height / 2
+        let cx = canvasSize.width  / 2
+        let cy = canvasSize.height / 2
 
         let seriesItems   = items.filter { $0.branch == 0 }
         let parallelGroups = Dictionary(grouping: items.filter { $0.branch > 0 }, by: { $0.branch })
@@ -877,7 +937,6 @@ struct CircuitEditorView: View {
         components = placed
         wires      = newWires
         saveChanges()
-        generatedAnchor = CGPoint(x: cx, y: cy)
     }
 
     // MARK: - AI: analyse circuit
@@ -937,70 +996,188 @@ struct CircuitEditorView: View {
         isAnalyzing = false
     }
 
-    // BFS from battery + terminal to assign a consistent current-flow direction
-    // to every wire. Returns true = flow start→end, false = flow end→start.
-    private func buildFlowDirections() -> [UUID: Bool] {
-        var dir = [UUID: Bool]()
+    // Real nodal analysis (Kirchhoff's current law), not a path-guessing
+    // heuristic — this is what actually "understands" a parallel circuit
+    // for any topology, not just clean textbook series/parallel:
+    //
+    //   1. Every wire/resistor/ideal-component becomes a conductance edge
+    //      (1/R) between two electrical nodes (points within `threshold`
+    //      of each other are the same node). Capacitors and open switches
+    //      contribute no edge at all — a capacitor blocks steady-state DC
+    //      once charged, and an open switch is simply a break.
+    //   2. The battery's "+" lead is pinned at its EMF, "−" at 0V (ground
+    //      reference). Every other node's voltage is an unknown solved via
+    //      Gaussian elimination from "current in = current out" at each
+    //      node — the textbook admittance-matrix method.
+    //   3. Current through every edge (including every wire) then falls
+    //      straight out of Ohm's law: I = (V_a − V_b) / R. A 100 Ω branch
+    //      and a 200 Ω branch in parallel solve to genuinely different
+    //      currents (twice as much through the 100 Ω one) automatically —
+    //      there's no "pick a path" step to get wrong.
+    //
+    // Wire absent from the result isn't electrically reachable from the
+    // battery's "+" terminal with a path back to "−" at all (the Golden
+    // Rule: no closed loop, no current) and never animates.
+    private func buildFlowDirections() -> [UUID: WireFlow] {
         let threshold: CGFloat = 60
 
-        // Locate battery and its + terminal (right side at rotation 0; adjust for rotation)
         guard let battery = components.first(where: { $0.type == .battery }) else {
-            // No battery: default all forward
-            return Dictionary(uniqueKeysWithValues: wires.map { ($0.id, true) })
+            return [:]   // No battery: nothing drives current, so nothing flows.
         }
+        let emf = battery.value ?? 9
+
+        // Battery leads: "+" is the long-line side (drawn at -44 before
+        // rotation), "−" is the short-line side (+44 before rotation) — see drawBattery.
         let rad = battery.rotation * .pi / 180
-        let posX = battery.x + 44 * cos(rad)
-        let posY = battery.y + 44 * sin(rad)
-        let seed = CGPoint(x: posX, y: posY)
+        let posTerminal = CGPoint(x: battery.x - 44 * cos(rad), y: battery.y - 44 * sin(rad))
+        let negTerminal = CGPoint(x: battery.x + 44 * cos(rad), y: battery.y + 44 * sin(rad))
 
-        // BFS: start from wires touching the + terminal
-        var frontier: [CGPoint] = []
+        // ── Collect every connection point: battery terminals, wire ends, component leads ──
+        var points: [CGPoint] = [posTerminal, negTerminal]
+        let posIdx = 0, negIdx = 1
+
+        struct WireRef { let wireID: UUID; let aIdx: Int; let bIdx: Int }
+        var wireRefs: [WireRef] = []
         for wire in wires {
-            let s = wire.start.cgPoint, e = wire.end.cgPoint
-            if hypot(seed.x - s.x, seed.y - s.y) < threshold {
-                dir[wire.id] = true; frontier.append(e)
-            } else if hypot(seed.x - e.x, seed.y - e.y) < threshold {
-                dir[wire.id] = false; frontier.append(s)
-            }
+            let aIdx = points.count; points.append(wire.start.cgPoint)
+            let bIdx = points.count; points.append(wire.end.cgPoint)
+            wireRefs.append(WireRef(wireID: wire.id, aIdx: aIdx, bIdx: bIdx))
         }
 
-        // Expand BFS through connected wire endpoints
-        var visited = Set(dir.keys)
-        while !frontier.isEmpty {
-            let pt = frontier.removeFirst()
-            for wire in wires where !visited.contains(wire.id) {
-                let s = wire.start.cgPoint, e = wire.end.cgPoint
-                if hypot(pt.x - s.x, pt.y - s.y) < threshold {
-                    dir[wire.id] = true; visited.insert(wire.id); frontier.append(e)
-                } else if hypot(pt.x - e.x, pt.y - e.y) < threshold {
-                    dir[wire.id] = false; visited.insert(wire.id); frontier.append(s)
+        struct CompRef { let resistance: Double; let aIdx: Int; let bIdx: Int }
+        var compRefs: [CompRef] = []
+        for comp in components where comp.type != .battery {
+            if comp.type == .switchComp && !comp.isClosed { continue }  // open switch: broken loop
+            if comp.type == .capacitor { continue }                     // blocks steady-state DC
+            let crad = comp.rotation * .pi / 180
+            let a = CGPoint(x: comp.x - 44 * cos(crad), y: comp.y - 44 * sin(crad))
+            let b = CGPoint(x: comp.x + 44 * cos(crad), y: comp.y + 44 * sin(crad))
+            let aIdx = points.count; points.append(a)
+            let bIdx = points.count; points.append(b)
+            let resistance: Double = comp.type == .resistor ? max(comp.value ?? 100, 0.01) : 0.0001
+            compRefs.append(CompRef(resistance: resistance, aIdx: aIdx, bIdx: bIdx))
+        }
+
+        // ── Union points within `threshold` of each other into shared electrical nodes ──
+        var parent = Array(0..<points.count)
+        func find(_ x: Int) -> Int {
+            var x = x
+            while parent[x] != x { x = parent[x] }
+            return x
+        }
+        func union(_ a: Int, _ b: Int) {
+            let ra = find(a), rb = find(b)
+            if ra != rb { parent[ra] = rb }
+        }
+        for i in 0..<points.count {
+            for j in (i + 1)..<points.count {
+                if hypot(points[i].x - points[j].x, points[i].y - points[j].y) < threshold {
+                    union(i, j)
                 }
             }
         }
 
-        // Fallback for disconnected wires
-        for wire in wires where dir[wire.id] == nil { dir[wire.id] = true }
-        return dir
+        struct CondEdge { let a: Int; let b: Int; let resistance: Double; let wireID: UUID? }
+        var edges: [CondEdge] = []
+        for w in wireRefs { edges.append(CondEdge(a: find(w.aIdx), b: find(w.bIdx), resistance: 0.0001, wireID: w.wireID)) }
+        for c in compRefs  { edges.append(CondEdge(a: find(c.aIdx), b: find(c.bIdx), resistance: c.resistance, wireID: nil)) }
+        edges.removeAll { $0.a == $0.b }   // self-loop: both leads landed on the same node
+
+        let posNode = find(posIdx), negNode = find(negIdx)
+
+        // ── The Golden Rule: is there any path at all from + to −? ──
+        var adjacency: [Int: [Int]] = [:]
+        for e in edges {
+            adjacency[e.a, default: []].append(e.b)
+            adjacency[e.b, default: []].append(e.a)
+        }
+        var reachable: Set<Int> = [posNode]
+        var frontier = [posNode]
+        while !frontier.isEmpty {
+            let n = frontier.removeLast()
+            for neighbor in adjacency[n] ?? [] where !reachable.contains(neighbor) {
+                reachable.insert(neighbor); frontier.append(neighbor)
+            }
+        }
+        guard reachable.contains(negNode) else { return [:] }   // no closed loop: nothing flows.
+
+        // ── Nodal analysis: unknowns are every reachable node except the
+        // two fixed battery terminals ──
+        let freeNodes = reachable.subtracting([posNode, negNode]).sorted()
+        let nodeIndex = Dictionary(uniqueKeysWithValues: freeNodes.enumerated().map { ($1, $0) })
+        let n = freeNodes.count
+
+        var G = Array(repeating: Array(repeating: 0.0, count: n), count: n)
+        var rhs = Array(repeating: 0.0, count: n)
+
+        for e in edges {
+            guard reachable.contains(e.a), reachable.contains(e.b) else { continue }
+            let g = 1.0 / e.resistance
+            switch (nodeIndex[e.a], nodeIndex[e.b]) {
+            case (let i?, let j?):
+                G[i][i] += g; G[j][j] += g
+                G[i][j] -= g; G[j][i] -= g
+            case (let i?, nil):
+                G[i][i] += g
+                rhs[i] += g * (e.b == posNode ? emf : 0)
+            case (nil, let j?):
+                G[j][j] += g
+                rhs[j] += g * (e.a == posNode ? emf : 0)
+            case (nil, nil):
+                break   // both ends fixed (e.g. a wire shorting the battery directly)
+            }
+        }
+
+        let voltages = n > 0 ? (solveLinear(G, rhs) ?? []) : []
+        guard n == 0 || voltages.count == n else { return [:] }
+        func voltage(at node: Int) -> Double {
+            if node == posNode { return emf }
+            if node == negNode { return 0 }
+            return nodeIndex[node].map { voltages[$0] } ?? 0
+        }
+
+        // ── Current through every wire, straight from Ohm's law ──
+        var currents: [UUID: (magnitude: Double, forward: Bool)] = [:]
+        var maxCurrent = 0.0001
+        for e in edges {
+            guard let wireID = e.wireID, reachable.contains(e.a), reachable.contains(e.b) else { continue }
+            let i = (voltage(at: e.a) - voltage(at: e.b)) / e.resistance
+            currents[wireID] = (abs(i), i >= 0)
+            maxCurrent = max(maxCurrent, abs(i))
+        }
+
+        var flow: [UUID: WireFlow] = [:]
+        for (wireID, c) in currents {
+            let share = c.magnitude / maxCurrent
+            guard share > 0.001 else { continue }   // negligible current: don't animate
+            flow[wireID] = WireFlow(forward: c.forward, share: share)
+        }
+        return flow
     }
 
-    // Returns dot speed for a wire based on proximity to component types.
-    private func animSpeed(near wire: CircuitWire) -> Double {
-        let mx = (wire.start.x + wire.end.x) / 2
-        let my = (wire.start.y + wire.end.y) / 2
-        for comp in components {
-            let d = hypot(comp.x - mx, comp.y - my)
-            if d < 90 {
-                switch comp.type {
-                case .resistor:  return 0.3
-                case .battery:   return 2.5
-                case .led:       return 1.5
-                case .capacitor: return 0.08
-                case .inductor:  return 0.5
-                default:         return 1.0
-                }
+    /// Gaussian elimination with partial pivoting. Returns nil if the
+    /// system is singular (shouldn't happen for a circuit whose free nodes
+    /// are all reachable from a fixed terminal, but guards against it).
+    private func solveLinear(_ a: [[Double]], _ b: [Double]) -> [Double]? {
+        let n = b.count
+        guard n > 0 else { return [] }
+        var m = a, rhs = b
+        for col in 0..<n {
+            var maxRow = col
+            for row in (col + 1)..<n where abs(m[row][col]) > abs(m[maxRow][col]) { maxRow = row }
+            m.swapAt(col, maxRow); rhs.swapAt(col, maxRow)
+            guard abs(m[col][col]) > 1e-12 else { return nil }
+            let piv = m[col][col]
+            for c in col..<n { m[col][c] /= piv }
+            rhs[col] /= piv
+            for row in 0..<n where row != col {
+                let f = m[row][col]
+                guard abs(f) > 1e-14 else { continue }
+                for c in col..<n { m[row][c] -= f * m[col][c] }
+                rhs[row] -= f * rhs[col]
             }
         }
-        return 1.0
+        return rhs
     }
 }
 
@@ -1009,14 +1186,52 @@ struct CircuitEditorView: View {
 struct CircuitSymbolView: View {
     let component: CircuitComponent
     let isSelected: Bool
+    /// Terminal dots only render/respond to taps in wire mode, so they
+    /// never steal a tap meant for select/erase/value-edit the rest of the time.
+    var isWireMode: Bool = false
+    /// Called with `true` for the first/left lead, `false` for the
+    /// second/right lead — nil for Ground, which only has one. The caller
+    /// (CircuitEditorView) computes the actual canvas-space point itself,
+    /// using the same ±44-from-center/rotation math as the electrical model
+    /// in buildFlowDirections, so a tapped terminal always lines up exactly
+    /// with where a wire would snap to.
+    var onTerminalTap: ((Bool) -> Void)? = nil
 
     private let W: CGFloat = 88
     private let H: CGFloat = 50
 
+    /// Terminal dots, in this view's own unrotated local coordinates —
+    /// SwiftUI's rotationEffect on the enclosing frame carries them around
+    /// with the drawn symbol automatically. Matches the ±44 electrical
+    /// lead offset from buildFlowDirections, not the ±42 purely-visual
+    /// lead endpoint the Canvas drawer uses (imperceptibly different, but
+    /// keeps the tappable dot exactly on the grid point wires snap to).
+    private var terminalPoints: [(isFirst: Bool, point: CGPoint)] {
+        let cx = W / 2, cy = H / 2
+        if component.type == .ground {
+            return [(true, CGPoint(x: cx, y: cy - 16))]
+        }
+        return [(true, CGPoint(x: cx - 44, y: cy)), (false, CGPoint(x: cx + 44, y: cy))]
+    }
+
     var body: some View {
         ZStack {
-            Canvas { ctx, size in
-                CircuitSymbolDrawer.draw(component: component, in: ctx, size: size)
+            ZStack {
+                Canvas { ctx, size in
+                    CircuitSymbolDrawer.draw(component: component, in: ctx, size: size)
+                }
+
+                if isWireMode {
+                    ForEach(Array(terminalPoints.enumerated()), id: \.offset) { _, term in
+                        Circle()
+                            .fill(Color.cyan.opacity(0.85))
+                            .frame(width: 11, height: 11)
+                            .overlay(Circle().strokeBorder(Color.white.opacity(0.7), lineWidth: 1))
+                            .position(term.point)
+                            .contentShape(Circle())
+                            .onTapGesture { onTerminalTap?(term.isFirst) }
+                    }
+                }
             }
             .frame(width: W, height: H)
             .rotationEffect(.degrees(component.rotation))

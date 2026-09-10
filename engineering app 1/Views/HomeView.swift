@@ -10,7 +10,7 @@ import SwiftUI
 import SwiftData
 import UniformTypeIdentifiers
 
-/// Lightweight payload for dragging a derivation onto a project folder.
+/// Lightweight payload for dragging a note onto a book (folder).
 struct NotepadDrag: Transferable, Codable {
     let id: PersistentIdentifier
     static var transferRepresentation: some TransferRepresentation {
@@ -20,6 +20,7 @@ struct NotepadDrag: Transferable, Codable {
 
 enum SidebarSelection: Hashable {
     case loose
+    case library
     case folder(PersistentIdentifier)
     case circuit(PersistentIdentifier)
     case fbd(PersistentIdentifier)
@@ -46,7 +47,22 @@ struct HomeView: View {
     @Query(sort: \TrussDiagram.createdDate,       order: .reverse) private var trusses:      [TrussDiagram]
 
     @State private var selection: SidebarSelection? = .loose
-    @State private var openNotepadID: PersistentIdentifier?
+    // Holds the live model directly rather than a PersistentIdentifier — a
+    // freshly-inserted object's identifier is temporary until SwiftData's
+    // next autosave, and re-resolving it via modelContext.model(for:) on
+    // every body re-render can crash with "model instance was invalidated"
+    // once that temporary identifier is retired.
+    @State private var openNotepad: Notepad?
+    // Same rationale as openNotepad above — hold the live diagram objects
+    // directly rather than re-resolving a PersistentIdentifier from
+    // `selection` on every body re-render, which crashes with "model
+    // instance was invalidated" once a freshly-created diagram's temporary
+    // identifier is retired by SwiftData's next autosave.
+    @State private var openCircuit: CircuitDiagram?
+    @State private var openFBD: FBDDiagram?
+    @State private var openBeam: BeamDiagram?
+    @State private var openVectorField: VectorFieldDiagram?
+    @State private var openTruss: TrussDiagram?
     @State private var sort: NotepadSort = .lastEdited
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
@@ -77,6 +93,13 @@ struct HomeView: View {
     @State private var trussRenameText = ""
     @State private var showTrussRenameAlert = false
 
+    // Notebook side panel (replaces the Home/Library list while in a book or note)
+    @State private var canvasUndoManager: UndoManager? = nil
+    @State private var pendingGraphRequest: String? = nil
+    @State private var chapterRenameTarget: Chapter?
+    @State private var chapterRenameText = ""
+    @State private var showChapterRenameAlert = false
+
     // Sidebar expand state
     @State private var specialExpanded       = false
     @State private var otherProjectsExpanded = false
@@ -89,7 +112,11 @@ struct HomeView: View {
     @AppStorage(LayoutPrefs.showDates)         private var showDates          = true
     @AppStorage(LayoutPrefs.accentRaw)         private var accentRaw          = LayoutAccent.blue.rawValue
     @AppStorage(LayoutPrefs.defaultPaperStyle) private var defaultPaperStyleRaw = PaperStyle.grid.rawValue
+    @AppStorage(LayoutPrefs.defaultPaperColorHex) private var defaultPaperColorHex = "#FFFFFF"
     @AppStorage("isDarkMode")                 private var isDarkMode         = false
+    @AppStorage("settings.theme.oledBlack")   private var oledBlack          = false
+    @AppStorage("onboarding.completed")       private var onboardingCompleted = false
+    @State private var showOnboarding = false
 
     private var accent: Color { LayoutAccent(rawValue: accentRaw)?.color ?? .blue }
 
@@ -100,16 +127,6 @@ struct HomeView: View {
         return nil
     }
 
-    private var openNotepad: Notepad? {
-        guard let openNotepadID else { return nil }
-        return modelContext.model(for: openNotepadID) as? Notepad
-    }
-
-    private var containerNotepads: [Notepad] {
-        let list = selectedFolder?.notepads ?? notepads.filter { $0.folder == nil }
-        return sorted(list)
-    }
-
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebar
@@ -117,7 +134,28 @@ struct HomeView: View {
             detail
         }
         .tint(accent)
-        .onChange(of: selection) { _, _ in openNotepadID = nil }
+        .onChange(of: selection) { _, new in
+            openNotepad = nil
+            // Resolve from the live @Query arrays (never a stale
+            // PersistentIdentifier lookup) — but only overwrite when a match
+            // is found, so a diagram set directly by create*() moments ago
+            // isn't clobbered by a @Query that hasn't caught up yet.
+            if case let .circuit(id) = new {
+                if let f = circuits.first(where: { $0.persistentModelID == id }) { openCircuit = f }
+            } else { openCircuit = nil }
+            if case let .fbd(id) = new {
+                if let f = fbds.first(where: { $0.persistentModelID == id }) { openFBD = f }
+            } else { openFBD = nil }
+            if case let .beam(id) = new {
+                if let f = beams.first(where: { $0.persistentModelID == id }) { openBeam = f }
+            } else { openBeam = nil }
+            if case let .vectorField(id) = new {
+                if let f = vectorFields.first(where: { $0.persistentModelID == id }) { openVectorField = f }
+            } else { openVectorField = nil }
+            if case let .truss(id) = new {
+                if let f = trusses.first(where: { $0.persistentModelID == id }) { openTruss = f }
+            } else { openTruss = nil }
+        }
         .alert("New Project", isPresented: $showNewFolderAlert) {
             TextField("Project name", text: $newFolderName)
             Button("Cancel", role: .cancel) { newFolderName = "" }
@@ -158,90 +196,205 @@ struct HomeView: View {
             Button("Cancel", role: .cancel) { trussRenameTarget = nil }
             Button("Save") { commitTrussRename() }
         }
+        .alert("Rename Chapter", isPresented: $showChapterRenameAlert) {
+            TextField("Name", text: $chapterRenameText)
+            Button("Cancel", role: .cancel) { chapterRenameTarget = nil }
+            Button("Save") { commitChapterRename() }
+        }
     }
 
     // MARK: - Detail
 
     @ViewBuilder
     private var detail: some View {
-        if case let .circuit(id) = selection,
-           let circ = modelContext.model(for: id) as? CircuitDiagram {
+        if let openCircuit {
             #if os(iOS)
-            CircuitEditorView(diagram: circ, onBack: {
+            CircuitEditorView(diagram: openCircuit, onBack: {
                 withAnimation { selection = .loose; columnVisibility = .all }
             })
-            .id(id)
+            .id(openCircuit.persistentModelID)
             #endif
-        } else if case let .fbd(id) = selection,
-                  let fbd = modelContext.model(for: id) as? FBDDiagram {
+        } else if let openFBD {
             #if os(iOS)
-            FBDEditorView(diagram: fbd, onBack: {
+            FBDEditorView(diagram: openFBD, onBack: {
                 withAnimation { selection = .loose; columnVisibility = .all }
             })
-            .id(id)
+            .id(openFBD.persistentModelID)
             #endif
-        } else if case let .beam(id) = selection,
-                  let beam = modelContext.model(for: id) as? BeamDiagram {
+        } else if let openBeam {
             #if os(iOS)
-            ShearBendingView(diagram: beam, onBack: {
+            ShearBendingView(diagram: openBeam, onBack: {
                 withAnimation { selection = .loose; columnVisibility = .all }
             })
-            .id(id)
+            .id(openBeam.persistentModelID)
             #endif
-        } else if case let .vectorField(id) = selection,
-                  let vf = modelContext.model(for: id) as? VectorFieldDiagram {
+        } else if let openVectorField {
             #if os(iOS)
-            VectorFieldView(diagram: vf, onBack: {
+            VectorFieldView(diagram: openVectorField, onBack: {
                 withAnimation { selection = .loose; columnVisibility = .all }
             })
-            .id(id)
+            .id(openVectorField.persistentModelID)
             #endif
-        } else if case let .truss(id) = selection,
-                  let truss = modelContext.model(for: id) as? TrussDiagram {
+        } else if let openTruss {
             #if os(iOS)
-            TrussEditorView(diagram: truss, onBack: {
+            TrussEditorView(diagram: openTruss, onBack: {
                 withAnimation { selection = .loose; columnVisibility = .all }
             })
-            .id(id)
+            .id(openTruss.persistentModelID)
             #endif
         } else if let openNotepad {
-            NotepadEditorView(notepad: openNotepad, onBack: closeNotepad)
-                .id(openNotepad.persistentModelID)
+            NotepadEditorView(
+                notepad: openNotepad,
+                onHome: goHome,
+                onToggleSidebar: toggleSidebar,
+                onUndoManagerReady: { canvasUndoManager = $0 },
+                requestedGraph: pendingGraphRequest
+            )
+            .id(openNotepad.persistentModelID)
+        } else if selection == .library {
+            LibraryView(
+                onSelectBook: { book in
+                    withAnimation { selection = .folder(book.persistentModelID) }
+                },
+                onRenameBook: beginFolderRename
+            )
+        } else if selectedFolder != nil {
+            ContentUnavailableView {
+                Label("Select a Note", systemImage: "doc.text")
+            } description: {
+                Text("Choose a note from a chapter, or create a new one.")
+            }
         } else {
             NotepadGridView(
-                title: selectedFolder?.name ?? "All Derivations",
-                notepads: containerNotepads,
+                notepads: sorted(notepads.filter { $0.folder == nil }),
+                books: recentBooks,
                 showDates: showDates,
-                isInFolder: selectedFolder != nil,
                 onOpen: open,
+                onOpenBook: { book in withAnimation { selection = .folder(book.persistentModelID) } },
                 onNew: createNotepad,
                 onRename: beginRename,
                 onDelete: delete,
-                onRemoveFromFolder: { $0.folder = nil }
+                onRenameBook: beginFolderRename,
+                onDeleteBook: deleteFolder
             )
+        }
+    }
+
+    /// Books ordered by most recent activity (latest note edit, or creation
+    /// date for an empty book), for Home's "Recent Books" section.
+    private var recentBooks: [Folder] {
+        folders.sorted {
+            let lhs = $0.notepads.map(\.lastEditedDate).max() ?? $0.createdDate
+            let rhs = $1.notepads.map(\.lastEditedDate).max() ?? $1.createdDate
+            return lhs > rhs
         }
     }
 
     // MARK: - Sidebar
 
+    /// Only one sidebar is ever visible: the plain Home/Library list while
+    /// browsing, or the notebook side panel while inside a book or note —
+    /// never both at once.
+    @ViewBuilder
     private var sidebar: some View {
+        if let book = selectedFolder {
+            ChapterSidebarView(
+                book: book,
+                looseNotes: [],
+                graphHistory: openNotepad?.graphHistory ?? [],
+                selectedNote: $openNotepad,
+                onHome: goHome,
+                canUndo: canvasUndoManager != nil,
+                onUndo: { canvasUndoManager?.undo() },
+                onRedo: { canvasUndoManager?.redo() },
+                onAddNote: { addQuickNote(to: book) },
+                onCreateNote: { chapter in createNote(in: chapter) },
+                onNewChapter: { createChapter(for: book) },
+                onRenameChapter: beginChapterRename,
+                onDeleteChapter: deleteChapter,
+                onOpenGraph: openGraph
+            )
+            .navigationSplitViewColumnWidth(min: 240, ideal: 260, max: 280)
+        } else if openNotepad != nil {
+            ChapterSidebarView(
+                book: nil,
+                looseNotes: sorted(notepads.filter { $0.folder == nil }),
+                graphHistory: openNotepad?.graphHistory ?? [],
+                selectedNote: $openNotepad,
+                onHome: goHome,
+                canUndo: canvasUndoManager != nil,
+                onUndo: { canvasUndoManager?.undo() },
+                onRedo: { canvasUndoManager?.redo() },
+                onAddNote: createNotepad,
+                onCreateNote: { _ in },
+                onNewChapter: {},
+                onRenameChapter: { _ in },
+                onDeleteChapter: { _ in },
+                onOpenGraph: openGraph
+            )
+            .navigationSplitViewColumnWidth(min: 240, ideal: 260, max: 280)
+        } else {
+            homeLibraryList
+                .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 280)
+        }
+    }
+
+    /// Shows/hides the entire sidebar column (Home/Library list or the
+    /// notebook panel) via NavigationSplitView's own columnVisibility — the
+    /// same mechanism the diagram editors already use — rather than trying
+    /// to animate the column's width, which NavigationSplitView doesn't
+    /// reliably re-layout for.
+    private func toggleSidebar() {
+        withAnimation {
+            columnVisibility = columnVisibility == .detailOnly ? .all : .detailOnly
+        }
+    }
+
+    // Same light-green color for the "New note" pill and the sidebar
+    // selection indicator — kept visually distinct from each other by
+    // opacity alone, with selection more opaque so it doesn't get confused
+    // with the permanently-highlighted "New note" button.
+    private let sidebarAccent = PaperTheme.darkerColor(fromHex: "#f2f5da", by: 0.16)
+    private let sidebarAccentOpacity = 0.6
+    private let selectionOpacity = 0.85
+    // Home gets its own distinct outline color, separate from every other
+    // selectable row's shared sidebarAccent.
+    private let homeSelectionColor = PaperTheme.color(fromHex: "#847D75")
+
+    @ViewBuilder
+    private func selectionBackground(_ isSelected: Bool, color: Color? = nil) -> some View {
+        if isSelected {
+            let tint = color ?? sidebarAccent
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(tint.opacity(selectionOpacity))
+                    .padding(.vertical, 2)
+                Rectangle()
+                    .fill(tint)
+                    .frame(width: 3)
+                    .padding(.vertical, 4)
+                    .padding(.leading, 2)
+            }
+        }
+    }
+
+    private var homeLibraryList: some View {
         List(selection: $selection) {
 
             // ── Always-visible quick actions ──────────────────────────────
             Section {
                 Button(action: createNotepad) {
-                    Label("New Derivation", systemImage: "plus.circle.fill")
-                        .font(.body.weight(.semibold))
+                    Label("New note", systemImage: "plus")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 4)
                 }
                 .buttonStyle(.plain)
-
-                Button {
-                    newFolderName = ""
-                    showNewFolderAlert = true
-                } label: {
-                    Label("New Project", systemImage: "folder.badge.plus")
-                }
-                .buttonStyle(.plain)
+                .listRowBackground(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(sidebarAccent.opacity(sidebarAccentOpacity))
+                        .padding(.vertical, 2)
+                )
             }
 
             // ── Special – engineering tool creators ───────────────────────
@@ -284,32 +437,19 @@ struct HomeView: View {
                 .labelsHidden()
             }
 
-            // ── Workspace – notepads & folders ────────────────────────────
+            // ── Workspace – Home + Library ────────────────────────────────
             Section("Workspace") {
-                Label("All Derivations", systemImage: "tray.full")
+                Label("Home", systemImage: "house")
                     .tag(SidebarSelection.loose)
                     .dropDestination(for: NotepadDrag.self) { items, _ in
                         setFolder(nil, for: items)
                         return true
                     }
+                    .listRowBackground(selectionBackground(selection == .loose, color: homeSelectionColor))
 
-                ForEach(folders.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }) { folder in
-                    Label("\(folder.name) (\(folder.notepads.count))", systemImage: "folder")
-                        .tag(SidebarSelection.folder(folder.persistentModelID))
-                        .dropDestination(for: NotepadDrag.self) { items, _ in
-                            setFolder(folder, for: items)
-                            return true
-                        }
-                        .contextMenu {
-                            Button { beginFolderRename(folder) } label: { Label("Rename", systemImage: "pencil") }
-                            Button(role: .destructive) { deleteFolder(folder) } label: { Label("Delete Project", systemImage: "trash") }
-                        }
-                }
-                if folders.isEmpty {
-                    Text("No projects yet — tap New Project, then drag derivations into it.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                Label("Library", systemImage: "books.vertical")
+                    .tag(SidebarSelection.library)
+                    .listRowBackground(selectionBackground(selection == .library))
             }
 
             // ── Other Projects – collapsible engineering diagrams ─────────
@@ -319,6 +459,7 @@ struct HomeView: View {
                     ForEach(circuits) { circ in
                         Label(circ.title, systemImage: "bolt.circle.fill")
                             .tag(SidebarSelection.circuit(circ.persistentModelID))
+                            .listRowBackground(selectionBackground(selection == .circuit(circ.persistentModelID)))
                             .contextMenu {
                                 Button { beginCircuitRename(circ) } label: { Label("Rename", systemImage: "pencil") }
                                 Button(role: .destructive) { deleteCircuit(circ) } label: { Label("Delete", systemImage: "trash") }
@@ -336,6 +477,7 @@ struct HomeView: View {
                     ForEach(fbds) { fbd in
                         Label(fbd.title, systemImage: "arrow.up.and.down.and.arrow.left.and.right")
                             .tag(SidebarSelection.fbd(fbd.persistentModelID))
+                            .listRowBackground(selectionBackground(selection == .fbd(fbd.persistentModelID)))
                             .contextMenu {
                                 Button { beginFBDRename(fbd) } label: { Label("Rename", systemImage: "pencil") }
                                 Button(role: .destructive) { deleteFBD(fbd) } label: { Label("Delete", systemImage: "trash") }
@@ -353,6 +495,7 @@ struct HomeView: View {
                     ForEach(beams) { beam in
                         Label(beam.title, systemImage: "chart.xyaxis.line")
                             .tag(SidebarSelection.beam(beam.persistentModelID))
+                            .listRowBackground(selectionBackground(selection == .beam(beam.persistentModelID)))
                             .contextMenu {
                                 Button { beginBeamRename(beam) } label: { Label("Rename", systemImage: "pencil") }
                                 Button(role: .destructive) { deleteBeam(beam) } label: { Label("Delete", systemImage: "trash") }
@@ -370,6 +513,7 @@ struct HomeView: View {
                     ForEach(vectorFields) { vf in
                         Label(vf.title, systemImage: "arrow.clockwise.circle.fill")
                             .tag(SidebarSelection.vectorField(vf.persistentModelID))
+                            .listRowBackground(selectionBackground(selection == .vectorField(vf.persistentModelID)))
                             .contextMenu {
                                 Button { beginVFRename(vf) } label: { Label("Rename", systemImage: "pencil") }
                                 Button(role: .destructive) { deleteVF(vf) } label: { Label("Delete", systemImage: "trash") }
@@ -387,6 +531,7 @@ struct HomeView: View {
                     ForEach(trusses) { truss in
                         Label(truss.title, systemImage: "network")
                             .tag(SidebarSelection.truss(truss.persistentModelID))
+                            .listRowBackground(selectionBackground(selection == .truss(truss.persistentModelID)))
                             .contextMenu {
                                 Button { beginTrussRename(truss) } label: { Label("Rename", systemImage: "pencil") }
                                 Button(role: .destructive) { deleteTruss(truss) } label: { Label("Delete", systemImage: "trash") }
@@ -405,9 +550,22 @@ struct HomeView: View {
                     .fontWeight(.semibold)
             }
         }
-        .navigationTitle("Derivation Notes")
+        .navigationTitle("Notes")
         .safeAreaInset(edge: .bottom) { bottomBar }
-        .sheet(isPresented: $showLayoutSettings) { LayoutSettingsView() }
+        .onAppear {
+            if !onboardingCompleted { showOnboarding = true }
+            ChapterMigrationService.runIfNeeded(context: modelContext)
+        }
+        .onChange(of: onboardingCompleted) { _, completed in
+            if !completed { showOnboarding = true }
+        }
+        .sheet(isPresented: $showOnboarding) {
+            OnboardingView {
+                onboardingCompleted = true
+                showOnboarding = false
+            }
+        }
+        .sheet(isPresented: $showLayoutSettings) { SettingsView() }
         .sheet(isPresented: $showHandwritingMemory) {
             NavigationStack { HandwritingMemoryView() }
         }
@@ -416,7 +574,7 @@ struct HomeView: View {
     private var bottomBar: some View {
         HStack(spacing: 0) {
             Button { showLayoutSettings = true } label: {
-                Label("Customize Layout", systemImage: "slider.horizontal.3")
+                Label("Settings", systemImage: "slider.horizontal.3")
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
             }
@@ -462,6 +620,7 @@ struct HomeView: View {
     private func createNotepad() {
         let notepad = Notepad()
         notepad.paperStyleRaw = defaultPaperStyleRaw
+        notepad.paperColorHex = (isDarkMode && oledBlack) ? "#000000" : defaultPaperColorHex
         notepad.folder = selectedFolder
         modelContext.insert(notepad)
         
@@ -487,17 +646,80 @@ struct HomeView: View {
     }
 
     private func open(_ notepad: Notepad) {
-        openNotepadID = notepad.persistentModelID
-        withAnimation { columnVisibility = .detailOnly }
+        openNotepad = notepad
     }
 
-    private func closeNotepad() {
-        openNotepadID = nil
-        withAnimation { columnVisibility = .all }
+    private func goHome() {
+        withAnimation {
+            selection = .loose
+            openNotepad = nil
+            canvasUndoManager = nil
+            columnVisibility = .all
+        }
+    }
+
+    private func openGraph(_ expression: String) {
+        pendingGraphRequest = expression
+        DispatchQueue.main.async { pendingGraphRequest = nil }
+    }
+
+    // MARK: - Chapter / notebook-panel note creation
+
+    private func createNote(in chapter: Chapter) {
+        let notepad = Notepad()
+        notepad.paperStyleRaw = defaultPaperStyleRaw
+        notepad.paperColorHex = (isDarkMode && oledBlack) ? "#000000" : defaultPaperColorHex
+        notepad.assign(to: chapter)
+        modelContext.insert(notepad)
+
+        let firstPage = Page(pageIndex: 0)
+        firstPage.notepad = notepad
+        modelContext.insert(firstPage)
+
+        openNotepad = notepad
+    }
+
+    /// Adds a note to the book's first chapter, creating one if it has none yet.
+    private func addQuickNote(to book: Folder) {
+        createNote(in: firstOrNewChapter(for: book))
+    }
+
+    private func firstOrNewChapter(for book: Folder) -> Chapter {
+        if let existing = book.orderedChapters.first { return existing }
+        let chapter = Chapter(name: "Chapter 1", orderIndex: 0)
+        chapter.folder = book
+        modelContext.insert(chapter)
+        return chapter
+    }
+
+    private func createChapter(for book: Folder) {
+        let chapter = Chapter(name: "Chapter \(book.chapters.count + 1)", orderIndex: book.chapters.count)
+        chapter.folder = book
+        modelContext.insert(chapter)
+    }
+
+    private func deleteChapter(_ chapter: Chapter) {
+        if openNotepad?.chapter?.persistentModelID == chapter.persistentModelID {
+            openNotepad = nil
+        }
+        modelContext.delete(chapter)
+    }
+
+    private func beginChapterRename(_ chapter: Chapter) {
+        chapterRenameTarget = chapter
+        chapterRenameText = chapter.name
+        showChapterRenameAlert = true
+    }
+
+    private func commitChapterRename() {
+        guard let target = chapterRenameTarget else { return }
+        let trimmed = chapterRenameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        target.name = trimmed.isEmpty ? target.name : trimmed
+        chapterRenameTarget = nil
     }
 
     private func delete(_ notepad: Notepad) {
-        if openNotepadID == notepad.persistentModelID { openNotepadID = nil }
+        if openNotepad?.persistentModelID == notepad.persistentModelID { openNotepad = nil }
         modelContext.delete(notepad)
     }
 
@@ -517,7 +739,7 @@ struct HomeView: View {
     private func commitRename() {
         guard let target = renameTarget else { return }
         let trimmed = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
-        target.title = trimmed.isEmpty ? "New Derivation" : trimmed
+        target.title = trimmed.isEmpty ? "New note" : trimmed
         target.markEdited()
         renameTarget = nil
     }
@@ -538,6 +760,7 @@ struct HomeView: View {
     private func createCircuit() {
         let circuit = CircuitDiagram(title: "Circuit \(circuits.count + 1)")
         modelContext.insert(circuit)
+        openCircuit = circuit
         // Give SwiftData a tick to assign the persistent ID before selecting.
         DispatchQueue.main.async {
             selection = .circuit(circuit.persistentModelID)
@@ -547,7 +770,7 @@ struct HomeView: View {
 
     private func deleteCircuit(_ circuit: CircuitDiagram) {
         if case let .circuit(id) = selection, id == circuit.persistentModelID {
-            selection = .loose
+            selection = .loose; openCircuit = nil
         }
         modelContext.delete(circuit)
     }
@@ -570,6 +793,7 @@ struct HomeView: View {
     private func createFBD() {
         let fbd = FBDDiagram(title: "FBD \(fbds.count + 1)")
         modelContext.insert(fbd)
+        openFBD = fbd
         DispatchQueue.main.async {
             selection = .fbd(fbd.persistentModelID)
             withAnimation { columnVisibility = .detailOnly }
@@ -577,7 +801,7 @@ struct HomeView: View {
     }
 
     private func deleteFBD(_ fbd: FBDDiagram) {
-        if case let .fbd(id) = selection, id == fbd.persistentModelID { selection = .loose }
+        if case let .fbd(id) = selection, id == fbd.persistentModelID { selection = .loose; openFBD = nil }
         modelContext.delete(fbd)
     }
 
@@ -599,6 +823,7 @@ struct HomeView: View {
     private func createBeam() {
         let beam = BeamDiagram(title: "Beam \(beams.count + 1)")
         modelContext.insert(beam)
+        openBeam = beam
         DispatchQueue.main.async {
             selection = .beam(beam.persistentModelID)
             withAnimation { columnVisibility = .detailOnly }
@@ -606,7 +831,7 @@ struct HomeView: View {
     }
 
     private func deleteBeam(_ beam: BeamDiagram) {
-        if case let .beam(id) = selection, id == beam.persistentModelID { selection = .loose }
+        if case let .beam(id) = selection, id == beam.persistentModelID { selection = .loose; openBeam = nil }
         modelContext.delete(beam)
     }
 
@@ -628,6 +853,7 @@ struct HomeView: View {
     private func createVectorField() {
         let vf = VectorFieldDiagram(title: "Field \(vectorFields.count + 1)")
         modelContext.insert(vf)
+        openVectorField = vf
         DispatchQueue.main.async {
             selection = .vectorField(vf.persistentModelID)
             withAnimation { columnVisibility = .detailOnly }
@@ -635,7 +861,7 @@ struct HomeView: View {
     }
 
     private func deleteVF(_ vf: VectorFieldDiagram) {
-        if case let .vectorField(id) = selection, id == vf.persistentModelID { selection = .loose }
+        if case let .vectorField(id) = selection, id == vf.persistentModelID { selection = .loose; openVectorField = nil }
         modelContext.delete(vf)
     }
 
@@ -657,6 +883,7 @@ struct HomeView: View {
     private func createTruss() {
         let t = TrussDiagram(title: "Truss \(trusses.count + 1)")
         modelContext.insert(t)
+        openTruss = t
         DispatchQueue.main.async {
             selection = .truss(t.persistentModelID)
             withAnimation { columnVisibility = .detailOnly }
@@ -664,7 +891,7 @@ struct HomeView: View {
     }
 
     private func deleteTruss(_ t: TrussDiagram) {
-        if case let .truss(id) = selection, id == t.persistentModelID { selection = .loose }
+        if case let .truss(id) = selection, id == t.persistentModelID { selection = .loose; openTruss = nil }
         modelContext.delete(t)
     }
 
@@ -685,29 +912,36 @@ struct HomeView: View {
 // MARK: - Grid View & Card Components
 
 private struct NotepadGridView: View {
-    let title: String
     let notepads: [Notepad]
+    let books: [Folder]
     let showDates: Bool
-    let isInFolder: Bool
     let onOpen: (Notepad) -> Void
+    let onOpenBook: (Folder) -> Void
     let onNew: () -> Void
     let onRename: (Notepad) -> Void
     let onDelete: (Notepad) -> Void
-    let onRemoveFromFolder: (Notepad) -> Void
+    var onRenameBook: (Folder) -> Void = { _ in }
+    var onDeleteBook: (Folder) -> Void = { _ in }
 
-    private let columns = [GridItem(.adaptive(minimum: 180, maximum: 240), spacing: 20)]
+    private let noteColumns = [GridItem(.adaptive(minimum: 130, maximum: 165), spacing: 20)]
+    private let bookColumns = [GridItem(.adaptive(minimum: 130, maximum: 165), spacing: 20)]
 
     var body: some View {
-        Group {
-            if notepads.isEmpty {
-                ContentUnavailableView {
-                    Label("No Derivations", systemImage: "doc")
-                } description: {
-                    Text("Tap + to start a new derivation.")
-                }
-            } else {
-                ScrollView {
-                    LazyVGrid(columns: columns, spacing: 20) {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 32) {
+                Text("Home")
+                    .font(.system(size: 30, weight: .bold, design: .serif))
+
+                sectionHeader("Recent Notes")
+
+                if notepads.isEmpty {
+                    ContentUnavailableView {
+                        Label("No Notes", systemImage: "doc")
+                    } description: {
+                        Text("Tap + to start a new note.")
+                    }
+                } else {
+                    LazyVGrid(columns: noteColumns, spacing: 20) {
                         ForEach(notepads) { notepad in
                             Button { onOpen(notepad) } label: {
                                 NotepadCard(notepad: notepad, showDate: showDates)
@@ -716,52 +950,56 @@ private struct NotepadGridView: View {
                             .draggable(NotepadDrag(id: notepad.persistentModelID))
                             .contextMenu {
                                 Button { onRename(notepad) } label: { Label("Rename", systemImage: "pencil") }
-                                if isInFolder {
-                                    Button { onRemoveFromFolder(notepad) } label: {
-                                        Label("Remove from Project", systemImage: "folder.badge.minus")
-                                    }
-                                }
                                 Button(role: .destructive) { onDelete(notepad) } label: {
                                     Label("Delete", systemImage: "trash")
                                 }
                             }
                         }
                     }
-                    .padding()
+                }
+
+                if !books.isEmpty {
+                    Divider().opacity(0.4)
+
+                    sectionHeader("Recent Books")
+
+                    LazyVGrid(columns: bookColumns, spacing: 24) {
+                        ForEach(books) { book in
+                            Button { onOpenBook(book) } label: {
+                                BookCard(book: book)
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                Button { onRenameBook(book) } label: { Label("Rename", systemImage: "pencil") }
+                                Button(role: .destructive) { onDeleteBook(book) } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
+                        }
+                    }
                 }
             }
+            .padding(24)
         }
-        .navigationTitle(title)
+        .navigationTitle("Home")
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button(action: onNew) { Label("New Derivation", systemImage: "plus") }
+                Button(action: onNew) { Label("New note", systemImage: "plus") }
             }
         }
     }
-}
 
-private struct NotepadCard: View {
-    let notepad: Notepad
-    let showDate: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            RoundedRectangle(cornerRadius: 12)
-                .fill(.quaternary)
-                .frame(height: 150)
-                .overlay(Image(systemName: "function").font(.system(size: 36)).foregroundStyle(.tint))
-                .overlay(alignment: .bottomTrailing) {
-                    Text("\(notepad.pages.count) pg")
-                        .font(.caption2)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(.thinMaterial, in: Capsule())
-                        .padding(8)
-                }
-            Text(notepad.title).font(.headline).lineLimit(1)
-            if showDate {
-                Text(notepad.lastEditedDate, format: .relative(presentation: .named))
-                    .font(.caption).foregroundStyle(.secondary)
-            }
+    private func sectionHeader(_ title: String) -> some View {
+        HStack(spacing: 10) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Rectangle()
+                .fill(Color.secondary.opacity(0.25))
+                .frame(height: 1)
         }
     }
 }

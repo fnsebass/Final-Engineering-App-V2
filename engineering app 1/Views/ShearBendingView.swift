@@ -122,7 +122,7 @@ struct ShearBendingView: View {
                     Label("Calculate", systemImage: "chart.xyaxis.line")
                         .font(.system(size: 11, weight: .semibold)).foregroundStyle(.white)
                         .padding(.horizontal, 10).frame(height: 26)
-                        .background(Color.accentColor, in: Capsule())
+                        .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 7))
                 }.buttonStyle(.plain).padding(.trailing, 6)
             }
             .frame(height: 36)

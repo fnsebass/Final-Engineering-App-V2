@@ -13,11 +13,28 @@ import SwiftData
 struct DerivationNotesApp: App {
     var sharedModelContainer: ModelContainer = DerivationNotesApp.makeContainer()
     @AppStorage("isDarkMode") private var isDarkMode = false
+    @AppStorage("settings.theme.interfaceScale") private var interfaceScale = 1.0
+    @AppStorage(GeneralPrefs.language) private var languageRaw = AppLanguage.system.rawValue
+
+    /// Settings → General → App Language. There's no translated string catalog
+    /// yet, so this only overrides the locale used for built-in date/number
+    /// formatting (e.g. notepad card dates) rather than any UI text.
+    private var localeOverride: Locale? {
+        switch AppLanguage(rawValue: languageRaw) ?? .system {
+        case .system: return nil
+        case .english: return Locale(identifier: "en")
+        case .spanish: return Locale(identifier: "es")
+        case .french:  return Locale(identifier: "fr")
+        case .german:  return Locale(identifier: "de")
+        }
+    }
 
     var body: some Scene {
         WindowGroup {
             HomeView()
                 .preferredColorScheme(isDarkMode ? .dark : .light)
+                .dynamicTypeSize(InterfaceScale.dynamicTypeSize(for: interfaceScale))
+                .environment(\.locale, localeOverride ?? Locale.autoupdatingCurrent)
         }
         .modelContainer(sharedModelContainer)
     }
@@ -26,7 +43,7 @@ struct DerivationNotesApp: App {
     /// migrated (e.g. after a schema change during development), the old store
     /// is deleted and recreated so the app never gets stuck in a crash loop.
     private static func makeContainer() -> ModelContainer {
-        let schema = Schema([Notepad.self, Page.self, Folder.self, HandwritingCorrection.self,
+        let schema = Schema([Notepad.self, Page.self, Folder.self, Chapter.self, HandwritingCorrection.self,
                              CircuitDiagram.self, FBDDiagram.self, BeamDiagram.self, VectorFieldDiagram.self,
                              TrussDiagram.self, CanvasPhoto.self])
         let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)

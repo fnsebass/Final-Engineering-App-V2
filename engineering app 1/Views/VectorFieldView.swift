@@ -76,7 +76,7 @@ struct VectorFieldView: View {
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(addPositive ? Color.cyan : Color.orange)
                         .padding(.horizontal, 8).frame(height: 26)
-                        .background((addPositive ? Color.cyan : Color.orange).opacity(0.15), in: Capsule())
+                        .background((addPositive ? Color.cyan : Color.orange).opacity(0.15), in: RoundedRectangle(cornerRadius: 7))
                 }.buttonStyle(.plain)
 
                 Rectangle().fill(Color.primary.opacity(0.12)).frame(width: 1, height: 20).padding(.horizontal, 4)

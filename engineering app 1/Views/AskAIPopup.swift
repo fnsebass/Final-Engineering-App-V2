@@ -62,9 +62,9 @@ struct AskAIPopup: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(.ultraThinMaterial, in: Capsule())
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
         .overlay(
-            Capsule()
+            RoundedRectangle(cornerRadius: 14)
                 .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.12), radius: 10, x: 0, y: 4)

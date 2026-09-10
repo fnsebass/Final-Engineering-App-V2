@@ -134,49 +134,6 @@ struct GeneratedChemistryAnalysis {
     var findings: [String]
 }
 
-// MARK: - Handwriting Ambiguity Types
-
-/// One character or short fragment that the OCR may have misread.
-struct AmbiguousCharacter: Identifiable {
-    let id = UUID()
-    /// The fragment exactly as OCR produced it (e.g. "1og", "B").
-    let ocrFragment: String
-    /// 2-3 most likely interpretations, ordered by probability.
-    let alternatives: [String]
-    /// Brief reason for the ambiguity.
-    let reason: String
-}
-
-@Generable
-struct GeneratedAmbiguityReport {
-    @Guide(description: """
-    Each ambiguous fragment found. Return an EMPTY array if the text is \
-    clearly readable with no genuine character ambiguity.
-    """)
-    var ambiguities: [GeneratedAmbiguousFragment]
-}
-
-@Generable
-struct GeneratedAmbiguousFragment {
-    @Guide(description: """
-    The exact characters (1–5 chars) that OCR captured and that are \
-    genuinely ambiguous in handwriting. Include 1-2 surrounding letters \
-    for context — e.g. '1og' not just '1', 'S1n' not just 'S'. \
-    Only flag characters that could plausibly be different in cursive / \
-    print handwriting.
-    """)
-    var ocrFragment: String
-
-    @Guide(description: """
-    2 or 3 most likely correct interpretations ordered by probability. \
-    Examples: ['log','1og'], ['sin','S1n'], ['8','B'], ['v','u'].
-    """)
-    var alternatives: [String]
-
-    @Guide(description: "One sentence explaining which handwriting shape caused the ambiguity.")
-    var reason: String
-}
-
 /// Structured output used by the AI-powered graph expression extractor.
 @Generable
 struct GeneratedGraphExpression {
@@ -226,11 +183,6 @@ protocol EquationReviewService {
     /// Returns a clean plottable RHS expression extracted from raw OCR text,
     /// or nil if the model is unavailable or no expression was found.
     func extractGraphExpression(from rawOCR: String) async -> String?
-
-    /// Returns any characters in `text` that may have been misread by OCR,
-    /// with 2-3 likely alternatives per fragment. Returns [] when model is
-    /// unavailable or text has no ambiguous characters.
-    func findAmbiguities(in text: String) async -> [AmbiguousCharacter]
 }
 
 extension EquationReviewService {
@@ -241,10 +193,28 @@ extension EquationReviewService {
 
 struct OnDeviceEquationReviewService: EquationReviewService {
 
+    // Shared guidance on resolving individual-character misreads, embedded
+    // in every instruction string below. Apple's handwriting OCR (EquationOCR)
+    // has no math-specific model, so it frequently confuses visually similar
+    // isolated glyphs — this is the model's chance to use surrounding math
+    // context (which the glyph-level OCR doesn't have) to fix that.
+    private static let ambiguousCharacterGuide = """
+    AMBIGUOUS CHARACTERS: The OCR frequently confuses visually similar \
+    handwritten characters, most commonly x↔z, +↔=, 1↔l↔I, 0↔O, 5↔S, 2↔z, \
+    6↔b, 9↔g, and n↔h. When the OCR text contains a bracketed alternate like \
+    "x[or z]", silently choose whichever reading makes the surrounding \
+    equation mathematically valid, then drop the brackets — never repeat the \
+    bracket notation back in your answer. Even without brackets, if the most \
+    literal reading of a character would make the expression nonsensical \
+    (e.g. two operators in a row, a variable that appears from nowhere, an \
+    equation that can't balance), silently substitute whichever visually \
+    similar character makes it valid before solving.
+    """
+
     // OCR symbol correction guide embedded in every instruction string.
     // Tells the model exactly what Apple Vision substitutes for handwritten
     // math symbols so it can infer the correct expression before reasoning.
-    private let reviewInstructions = """
+    private let reviewInstructionsBase = """
     You are a careful math and engineering tutor reviewing handwritten notes \
     captured via Apple Pencil. The text below is OCR output and WILL contain \
     symbol substitutions — apply these corrections before interpreting anything:
@@ -271,12 +241,15 @@ struct OnDeviceEquationReviewService: EquationReviewService {
     EXPONENTS inline: "x 2"=x², "e -x"=e⁻ˣ, "m s -2"=m·s⁻². \
     OPERATORS: "<=" = ≤, ">=" = ≥, "!=" = ≠, "->" = →.
 
+    \(Self.ambiguousCharacterGuide)
+
     Infer the most plausible mathematical expression from context and solve it. \
-    Reply under 100 words. Use plain text only — no markdown, no asterisks, \
-    no bullet symbols, no dollar signs or backslash-bracket LaTeX notation. \
-    Use Unicode math symbols directly (∫ √ × → ≤ ∞ ∂). State your interpretation if ambiguous, \
-    then proceed. Flag any error with the specific mistake and correction. \
-    Never refuse — always give your best mathematical answer.
+    Keep your answer concise, but always finish your last sentence completely — \
+    never cut off mid-word or mid-step. Use plain text only — no markdown, no \
+    asterisks, no bullet symbols, no dollar signs or backslash-bracket LaTeX \
+    notation. Use Unicode math symbols directly (∫ √ × → ≤ ∞ ∂). State your \
+    interpretation if ambiguous, then proceed. Flag any error with the specific \
+    mistake and correction. Never refuse — always give your best mathematical answer.
     """
 
     private let stepInstructions = """
@@ -300,6 +273,8 @@ struct OnDeviceEquationReviewService: EquationReviewService {
     EXPONENTS: "x 2"=x², "v 2"=v², inline powers. \
     OPERATORS: "<="=≤, ">="=≥, "->"=→.
 
+    \(Self.ambiguousCharacterGuide)
+
     Break the work into individual steps in order. Judge each step \
     (isCorrect = true only if mathematically valid). For wrong steps, give \
     a short specific note about the actual mistake. Give a one-sentence overall \
@@ -311,6 +286,8 @@ struct OnDeviceEquationReviewService: EquationReviewService {
     private let algebraCheckInstructions = """
     You are a rigorous mathematics checker. Input is OCR text of handwritten algebraic work. \
     Apply the usual OCR corrections (S/J=∫, oo=∞, x2=x², d dx=d/dx) before analyzing.
+
+    \(Self.ambiguousCharacterGuide)
 
     Check the work for:
     1. Arithmetic errors — wrong computed values (e.g. 3×4 written as 11)
@@ -367,7 +344,7 @@ struct OnDeviceEquationReviewService: EquationReviewService {
     If no plottable equation exists, return an empty string and nothing else.
     """
 
-    private let explainInstructions = """
+    private let explainInstructionsBase = """
     You are a patient engineering and math tutor. The student's question was \
     captured from handwritten notes via Apple OCR. Correct these symbol \
     substitutions before explaining anything:
@@ -385,9 +362,13 @@ struct OnDeviceEquationReviewService: EquationReviewService {
     EXPONENTS inline: "x 2"=x², superscripts may vanish entirely. \
     OPERATORS: "<="=≤, "->"=→.
 
+    \(Self.ambiguousCharacterGuide)
+
     Identify the problem (state your interpretation of any ambiguous OCR), \
     then explain step-by-step HOW to solve it — teach the method so the \
-    student can handle similar problems. Number each step. Under 200 words. \
+    student can handle similar problems. Number each step. Keep the \
+    walkthrough focused, but always finish completely — never cut off \
+    mid-step or mid-sentence. \
     Use plain text only — no markdown, no asterisks for bold or italic, \
     no bullet symbols, no dollar signs or backslash-bracket LaTeX notation. \
     Use Unicode math symbols directly (∫ √ × → ≤ ∞ ∂ ²). Cover integration techniques \
@@ -396,6 +377,35 @@ struct OnDeviceEquationReviewService: EquationReviewService {
     engineering calculations. \
     If truly uninterpretable, describe what you see and ask what's needed.
     """
+
+    // MARK: - Tutor Interactions preferences (Settings → Intelligence → Tutor Interactions)
+
+    /// Extra guidance appended to the review/explain instructions based on the
+    /// Hint Style picker and the free-text Custom Prompting field. Read directly
+    /// from UserDefaults since this struct isn't a SwiftUI view.
+    nonisolated private var tutorPreferenceSuffix: String {
+        var lines: [String] = []
+
+        switch UserDefaults.standard.string(forKey: "settings.tutor.hintMode") {
+        case "minimal":
+            lines.append("Give only a single short hint toward the next step — do not fully solve the problem.")
+        case "full":
+            lines.append("Be thorough: explain the underlying concept as well as the steps.")
+        default:
+            break // "guided" (default) needs no extra instruction.
+        }
+
+        let custom = UserDefaults.standard.string(forKey: "settings.tutor.customPrompt")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !custom.isEmpty {
+            lines.append("Additional user preference: \(custom)")
+        }
+
+        return lines.isEmpty ? "" : "\n\n" + lines.joined(separator: " ")
+    }
+
+    nonisolated private var reviewInstructions: String { reviewInstructionsBase + tutorPreferenceSuffix }
+    nonisolated private var explainInstructions: String { explainInstructionsBase + tutorPreferenceSuffix }
 
     func availabilityReason() -> String? {
         let availability = SystemLanguageModel.default.availability
@@ -559,57 +569,6 @@ struct OnDeviceEquationReviewService: EquationReviewService {
                 return expr.isEmpty ? nil : expr
             } catch {
                 return nil
-            }
-        }.value
-    }
-
-    func findAmbiguities(in text: String) async -> [AmbiguousCharacter] {
-        guard let trimmed = prepared(text) else { return [] }
-        guard availabilityReason() == nil else { return [] }
-
-        let instructions = """
-        You analyze OCR output from handwritten math and engineering equations. \
-        Identify ONLY fragments where a character is genuinely ambiguous — i.e. it \
-        could plausibly be a different character in someone's handwriting.
-
-        Common handwriting ambiguities to look for:
-        • '1' vs 'l' (lowercase L) vs 'I' — especially inside function names: \
-          '1og' might be 'log', 's1n' might be 'sin', '1im' might be 'lim'.
-        • '0' vs 'O' — inside variable names or formulas.
-        • '2' vs 'z' — variable z may look like 2.
-        • 'B' vs '8' — coefficients or variables.
-        • 'u' vs 'v' vs '√' — when 'v' or 'V' appears directly before a \
-          parenthesised or superscript expression (e.g. 'V(x2+y2)', 'vx^2+y^2') \
-          it is almost certainly the square root symbol √. Flag it with \
-          alternatives ['sqrt(', 'v', 'u'] so the user can confirm.
-        • 'S' vs '∫' — when followed by an expression and 'dx'.
-        • 'x' vs '×' — multiplication.
-        • 'n' vs 'h' — sometimes confused in script.
-
-        RULES:
-        - Include 1-2 surrounding characters in ocrFragment for context.
-        - Return NO MORE THAN 4 ambiguities. Prioritize the most impactful ones.
-        - Do NOT flag digits inside clearly numeric expressions like '3x^2 + 1'.
-        - Do NOT flag characters that are unambiguous in context.
-        - If text has no genuine ambiguities, return an empty ambiguities array.
-        """
-
-        return await Task.detached(priority: .userInitiated) {
-            do {
-                let session = LanguageModelSession(instructions: instructions)
-                let response = try await session.respond(
-                    to: "OCR text from handwriting: \(trimmed)",
-                    generating: GeneratedAmbiguityReport.self
-                )
-                return response.content.ambiguities.map { a in
-                    AmbiguousCharacter(
-                        ocrFragment: a.ocrFragment,
-                        alternatives: a.alternatives,
-                        reason: a.reason
-                    )
-                }
-            } catch {
-                return []
             }
         }.value
     }
