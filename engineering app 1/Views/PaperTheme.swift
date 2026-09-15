@@ -96,9 +96,17 @@ enum PaperTheme {
 
     /// Pen color: high-contrast dark or light ink determined by paper background luminance.
     static func inkUIColor(forPaperHex hex: String) -> UIColor {
-        relativeLuminance(ofHex: hex) > 0.45
-            ? UIColor(red: 0, green: 0, blue: 0, alpha: 1)   // pure black #000000
-            : UIColor(red: 1, green: 1, blue: 1, alpha: 1)   // pure white #FFFFFF
+        isDarkPaper(hex: hex)
+            ? UIColor(red: 1, green: 1, blue: 1, alpha: 1)   // pure white #FFFFFF
+            : UIColor(red: 0, green: 0, blue: 0, alpha: 1)   // pure black #000000
+    }
+
+    /// Whether this paper is dark enough that pen strokes default to white
+    /// ink — used so thumbnail rendering can match PencilKit's own
+    /// light/dark adaptive black-and-white ink behavior instead of always
+    /// rendering strokes as if against a light background.
+    static func isDarkPaper(hex: String) -> Bool {
+        relativeLuminance(ofHex: hex) <= 0.45
     }
 
     static func inkColor(forPaperHex hex: String) -> Color {

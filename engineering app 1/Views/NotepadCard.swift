@@ -116,22 +116,32 @@ struct NotepadThumbnail: View {
             }
             .clipShape(RoundedRectangle(cornerRadius: 12))
             .task(id: notepad.persistentModelID) {
-                image = Self.renderThumbnail(for: notepad)
+                image = await Self.renderThumbnail(for: notepad)
             }
     }
 
     private var paperColor: Color { PaperTheme.color(fromHex: notepad.paperColorHex) }
 
     #if os(iOS)
-    private static func renderThumbnail(for notepad: Notepad) -> Image? {
+    private static func renderThumbnail(for notepad: Notepad) async -> Image? {
         guard let page = notepad.orderedPages.first, !page.drawingData.isEmpty,
               let drawing = try? PKDrawing(data: page.drawingData),
               !drawing.bounds.isEmpty else { return nil }
         let bounds = drawing.bounds.insetBy(dx: -12, dy: -12)
-        let rendered = drawing.image(from: bounds, scale: 1)
+        // Render through PKDrawing's own dark/light-aware draw(in:...) rather
+        // than the plain image(from:scale:) — that overload always renders
+        // adaptive black/white ink as if against a light background, which
+        // flips strokes the user drew in white (on dark paper) to black.
+        let isDark = PaperTheme.isDarkPaper(hex: notepad.paperColorHex)
+        UIGraphicsBeginImageContextWithOptions(bounds.size, false, 1)
+        defer { UIGraphicsEndImageContext() }
+        guard let ctx = UIGraphicsGetCurrentContext() else { return nil }
+        await drawing.draw(in: ctx, frame: CGRect(origin: .zero, size: bounds.size),
+                            from: bounds, darkUserInterfaceStyle: isDark)
+        guard let rendered = UIGraphicsGetImageFromCurrentImageContext() else { return nil }
         return Image(uiImage: rendered)
     }
     #else
-    private static func renderThumbnail(for notepad: Notepad) -> Image? { nil }
+    private static func renderThumbnail(for notepad: Notepad) async -> Image? { nil }
     #endif
 }

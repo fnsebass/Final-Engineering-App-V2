@@ -86,7 +86,7 @@ struct ScientificCalculatorView: View {
     // MARK: Function scroll bar
 
     private var functionScrollBar: some View {
-        FunctionKeyboardStrip(keys: FunctionKeyboardStrip.trigDefaults, onTap: tap)
+        FunctionKeyboardStrip(onTap: tap)
     }
 
     // MARK: Numpad

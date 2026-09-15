@@ -50,6 +50,7 @@ struct NotepadEditorView: View {
     var onToggleSidebar: () -> Void = {}
     var onUndoManagerReady: (UndoManager?) -> Void = { _ in }
     var requestedGraph: String? = nil
+    var requestedGraphForce3D: Bool? = nil
 
     @State private var showSettings = false
     @State private var isEditingTitle = false
@@ -164,7 +165,8 @@ struct NotepadEditorView: View {
             showPhotoPicker: $showPhotoPicker,
             activeShapeKind: activeShapeKind,
             onUndoManagerReady: onUndoManagerReady,
-            requestedGraph: requestedGraph
+            requestedGraph: requestedGraph,
+            requestedGraphForce3D: requestedGraphForce3D
         )
         #else
         ContentUnavailableView {

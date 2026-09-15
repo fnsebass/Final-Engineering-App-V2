@@ -80,8 +80,11 @@ enum MathEvaluator {
             ("⁶", "^6"), ("⁷", "^7"), ("⁸", "^8"), ("⁹", "^9"), ("⁰", "^0"),
         ]
         for (from, to) in superscripts { s = s.replacingOccurrences(of: from, with: to) }
-        // Unicode √ → sqrt  (if followed by "(", "sqrt(" is formed naturally)
+        // Unicode √ → sqrt, ∛ → cbrt  (if followed by "(", forms naturally)
         s = s.replacingOccurrences(of: "√", with: "sqrt")
+        s = s.replacingOccurrences(of: "∛", with: "cbrt")
+        // Unicode π constant → the "pi" word the lexer already recognizes
+        s = s.replacingOccurrences(of: "π", with: "pi")
         // Unicode caret lookalikes → ASCII ^
         s = s.replacingOccurrences(of: "ˆ", with: "^")   // U+02C6
         s = s.replacingOccurrences(of: "＾", with: "^")   // U+FF3E
@@ -164,8 +167,9 @@ enum MathEvaluator {
             case "pi": return .num(.pi)
             case "e":  return .num(Darwin.M_E)
             case "sqr": return .fn("sqrt")   // common OCR misread / abbreviation
-            case "sin", "cos", "tan", "sqrt", "abs", "log", "ln", "exp",
-                 "asin", "acos", "atan":
+            case "sin", "cos", "tan", "sqrt", "cbrt", "abs", "log", "log2", "ln", "exp",
+                 "asin", "acos", "atan",
+                 "sinh", "cosh", "tanh", "asinh", "acosh", "atanh":
                 return .fn(s)
             default:   return .num(0)
             }
@@ -251,18 +255,26 @@ enum MathEvaluator {
             guard let arg = parseExpr(&t, &i, x: x, y: y) else { return nil }
             if i < t.count, case .rparen = t[i] { i += 1 }
             switch name {
-            case "sin":  return sin(arg)
-            case "cos":  return cos(arg)
-            case "tan":  return tan(arg)
-            case "sqrt": return arg >= 0 ? sqrt(arg) : nil
-            case "abs":  return abs(arg)
-            case "log":  return arg > 0 ? log10(arg) : nil
-            case "ln":   return arg > 0 ? log(arg) : nil
-            case "exp":  return exp(arg)
-            case "asin": return asin(arg)
-            case "acos": return acos(arg)
-            case "atan": return atan(arg)
-            default:     return nil
+            case "sin":   return sin(arg)
+            case "cos":   return cos(arg)
+            case "tan":   return tan(arg)
+            case "sqrt":  return arg >= 0 ? sqrt(arg) : nil
+            case "cbrt":  return cbrt(arg)
+            case "abs":   return abs(arg)
+            case "log":   return arg > 0 ? log10(arg) : nil
+            case "log2":  return arg > 0 ? log2(arg) : nil
+            case "ln":    return arg > 0 ? log(arg) : nil
+            case "exp":   return exp(arg)
+            case "asin":  return asin(arg)
+            case "acos":  return acos(arg)
+            case "atan":  return atan(arg)
+            case "sinh":  return sinh(arg)
+            case "cosh":  return cosh(arg)
+            case "tanh":  return tanh(arg)
+            case "asinh": return asinh(arg)
+            case "acosh": return arg >= 1 ? acosh(arg) : nil
+            case "atanh": return (arg > -1 && arg < 1) ? atanh(arg) : nil
+            default:      return nil
             }
         default:
             return nil

@@ -77,6 +77,8 @@ struct CanvasWorkspace: View {
     /// nil right after setting it, so re-tapping the same history row still
     /// triggers `.onChange` below.
     var requestedGraph: String? = nil
+    /// Paired with `requestedGraph` — nil = auto-detect, true/false forces the mode.
+    var requestedGraphForce3D: Bool? = nil
 
     // Stored handwriting corrections (applied automatically before every action)
     @Query(sort: \HandwritingCorrection.useCount, order: .reverse)
@@ -373,9 +375,12 @@ struct CanvasWorkspace: View {
             }
             .onChange(of: requestedGraph) { _, expr in
                 guard let expr else { return }
+                // Strips a "z =" / "y =" / "f(x,y) =" prefix (typed via Quick
+                // Graph's new z/y keys) so the evaluator only ever sees the
+                // bare right-hand side.
                 graphEquationText = expr
-                graphExpression = expr
-                graphForce3D = nil
+                graphExpression = MathEvaluator.extractExpression(from: expr) ?? expr
+                graphForce3D = requestedGraphForce3D
                 recordGraphHistory(expr)
                 withAnimation { showGraph = true }
             }
@@ -489,9 +494,11 @@ struct CanvasWorkspace: View {
             if radialPaletteAnchor != nil {
                 radialPaletteAnchor = nil
             } else {
+                // The arc now bows up and to the left from the anchor, so it
+                // needs room to the left (as before) and above (not below).
                 let pad = RadialToolMenu.radius + 24
                 let x = pos.x.clamped(to: pad...max(pad, workspaceSize.width - 8))
-                let y = pos.y.clamped(to: 8...max(8, workspaceSize.height - pad))
+                let y = pos.y.clamped(to: pad...max(pad, workspaceSize.height - 8))
                 radialPaletteAnchor = CGPoint(x: x, y: y)
             }
         }

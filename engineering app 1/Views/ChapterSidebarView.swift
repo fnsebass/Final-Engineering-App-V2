@@ -45,7 +45,8 @@ struct ChapterSidebarView: View {
     var onNewChapter: () -> Void
     var onRenameChapter: (Chapter) -> Void
     var onDeleteChapter: (Chapter) -> Void
-    var onOpenGraph: (String) -> Void
+    /// Second param: nil = auto-detect 2-D/3-D, true = force 3-D, false = force 2-D.
+    var onOpenGraph: (String, Bool?) -> Void
 
     @State private var tab: PanelTab = .primary
 
@@ -232,27 +233,57 @@ struct ChapterSidebarView: View {
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 6) {
-                TextField("e.g. x^2 + sin(x)", text: $quickGraphExpr)
-                    .font(.system(.subheadline, design: .monospaced))
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
-                    .submitLabel(.go)
-                    .onSubmit(plotQuickGraph)
-                    .disabled(selectedNote == nil)
-
-                Button("Plot", action: plotQuickGraph)
-                    .font(.caption.weight(.semibold))
-                    .buttonStyle(.borderedProminent)
-                    .disabled(selectedNote == nil || quickGraphExpr.trimmingCharacters(in: .whitespaces).isEmpty)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    Text(quickGraphExpr.isEmpty ? "e.g. x^2 + sin(x)" : quickGraphExpr)
+                        .font(.system(.subheadline, design: .monospaced))
+                        .foregroundStyle(quickGraphExpr.isEmpty ? .tertiary : .primary)
+                }
+                Spacer(minLength: 0)
+                if !quickGraphExpr.isEmpty {
+                    Button {
+                        quickGraphExpr.removeLast()
+                    } label: {
+                        Image(systemName: "delete.backward")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
+            .padding(8)
+            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+            .opacity(selectedNote == nil ? 0.5 : 1)
+
+            FunctionKeyboardStrip { key in quickGraphExpr += key }
+                .disabled(selectedNote == nil)
+
+            EquationKeypad { key in quickGraphExpr += key }
+                .disabled(selectedNote == nil)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            HStack(spacing: 6) {
+                Button("Plot") { plotQuickGraph() }
+                    .frame(maxWidth: .infinity)
+
+                Button {
+                    plotQuickGraph(force3D: true)
+                } label: {
+                    Label("3-D", systemImage: "cube")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+            .font(.caption.weight(.semibold))
+            .buttonStyle(.borderedProminent)
+            .disabled(selectedNote == nil || quickGraphExpr.trimmingCharacters(in: .whitespaces).isEmpty)
         }
         .padding(12)
     }
 
-    private func plotQuickGraph() {
+    private func plotQuickGraph(force3D: Bool? = nil) {
         let expr = quickGraphExpr.trimmingCharacters(in: .whitespaces)
         guard !expr.isEmpty else { return }
-        onOpenGraph(expr)
+        onOpenGraph(expr, force3D)
         quickGraphExpr = ""
     }
 
@@ -274,7 +305,7 @@ struct ChapterSidebarView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(graphHistory.reversed(), id: \.self) { expr in
-                        Button { onOpenGraph(expr) } label: {
+                        Button { onOpenGraph(expr, nil) } label: {
                             HStack {
                                 Image(systemName: "function")
                                     .font(.caption)

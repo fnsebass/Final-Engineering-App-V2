@@ -96,6 +96,7 @@ struct HomeView: View {
     // Notebook side panel (replaces the Home/Library list while in a book or note)
     @State private var canvasUndoManager: UndoManager? = nil
     @State private var pendingGraphRequest: String? = nil
+    @State private var pendingGraphForce3D: Bool? = nil
     @State private var chapterRenameTarget: Chapter?
     @State private var chapterRenameText = ""
     @State private var showChapterRenameAlert = false
@@ -248,7 +249,8 @@ struct HomeView: View {
                 onHome: goHome,
                 onToggleSidebar: toggleSidebar,
                 onUndoManagerReady: { canvasUndoManager = $0 },
-                requestedGraph: pendingGraphRequest
+                requestedGraph: pendingGraphRequest,
+                requestedGraphForce3D: pendingGraphForce3D
             )
             .id(openNotepad.persistentModelID)
         } else if selection == .library {
@@ -266,7 +268,7 @@ struct HomeView: View {
             }
         } else {
             NotepadGridView(
-                notepads: sorted(notepads.filter { $0.folder == nil }),
+                notepads: sorted(notepads),
                 books: recentBooks,
                 showDates: showDates,
                 onOpen: open,
@@ -646,6 +648,11 @@ struct HomeView: View {
     }
 
     private func open(_ notepad: Notepad) {
+        // Opening a note that lives inside a book should bring up that
+        // book's chapter sidebar, same as opening it via Library would.
+        if let folder = notepad.folder {
+            selection = .folder(folder.persistentModelID)
+        }
         openNotepad = notepad
     }
 
@@ -658,7 +665,8 @@ struct HomeView: View {
         }
     }
 
-    private func openGraph(_ expression: String) {
+    private func openGraph(_ expression: String, force3D: Bool? = nil) {
+        pendingGraphForce3D = force3D
         pendingGraphRequest = expression
         DispatchQueue.main.async { pendingGraphRequest = nil }
     }

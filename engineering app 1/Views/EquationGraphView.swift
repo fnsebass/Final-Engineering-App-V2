@@ -31,7 +31,6 @@ struct EquationGraphView: View {
     let onPin:           (() -> Void)?
 
     @State private var editExpr: String
-    @FocusState private var fieldFocused: Bool
 
     // 2-D state
     @State private var xMin: Double = -10
@@ -82,9 +81,10 @@ struct EquationGraphView: View {
         VStack(spacing: 0) {
             header
             expressionRow
-            FunctionKeyboardStrip(keys: FunctionKeyboardStrip.trigDefaults) { key in
+            FunctionKeyboardStrip { key in
                 editExpr += key
             }
+            EquationKeypad { key in editExpr += key }
             Divider()
             if editExpr.trimmingCharacters(in: .whitespaces).isEmpty {
                 emptyPrompt
@@ -215,18 +215,26 @@ struct EquationGraphView: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.blue)
                 .frame(width: 16)
-            TextField("e.g. cos(sqrt(x^2+y^2))", text: $editExpr)
-                .font(.system(.caption, design: .monospaced))
-                .autocorrectionDisabled()
-                .textInputAutocapitalization(.never)
-                .submitLabel(.done)
-                .focused($fieldFocused)
-                .onSubmit { fieldFocused = false }
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(editExpr.isEmpty ? "e.g. cos(sqrt(x^2+y^2))" : editExpr)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(editExpr.isEmpty ? .tertiary : .primary)
+            }
+            Spacer(minLength: 0)
+            if !editExpr.isEmpty {
+                Button {
+                    editExpr.removeLast()
+                } label: {
+                    Image(systemName: "delete.backward")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
             // Reset button — only visible when user has drifted from OCR suggestion
             if !editExpr.isEmpty && editExpr != expression {
                 Button {
                     editExpr = expression
-                    fieldFocused = false
                 } label: {
                     Image(systemName: "arrow.counterclockwise")
                         .font(.caption2)

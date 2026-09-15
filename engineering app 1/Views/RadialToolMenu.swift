@@ -2,21 +2,21 @@
 //  RadialToolMenu.swift
 //  Tolerance
 //
-//  A tool/color palette arranged along a thin outlined arc following the
-//  outline of a quarter circle, shown as a floating overlay (no filled
-//  card/box behind it — just the arc outline, icons, and color dots)
-//  anchored to the Apple Pencil's current or last-known position. See
-//  CanvasWorkspace.handleShowToolPalette for how the anchor point is
-//  resolved and this view is positioned.
+//  A tool/color palette arranged along a translucent grey tube that traces
+//  a tight 90pt-radius arc centered on the Apple Pencil's tip, shown as a
+//  floating overlay anchored to the Pencil's current or last-known
+//  position. See CanvasWorkspace.handleShowToolPalette for how the anchor
+//  point is resolved and this view is positioned.
 //
-//  The quarter circle (90°-180°, SwiftUI y-down convention: 90° points
-//  straight down from the pivot/anchor, 180° points straight left) is split
-//  down the middle:
-//    • Top half   (90°-135°)  — Eraser, Highlighter, Straight Line, Shape.
+//  In SwiftUI's y-down screen convention, the arc runs 170°-280° (180°
+//  points straight left from the pivot/anchor — the negative x-axis; 270°
+//  points straight up — the positive y-axis; this stretches 10° past each
+//  of those for a wider, 110° sweep). It's split down the middle:
+//    • First half  (170°-225°) — Eraser, Highlighter, Straight Line, Shape.
 //      Each is a bare icon with no background; only the currently active
 //      tool gets a faint circle behind it.
-//    • Bottom half (135°-180°) — ink colors, rendered as the same style of
-//      icon as the top half (a tinted circle glyph, not a big solid dot),
+//    • Second half (225°-280°) — ink colors, rendered as the same style of
+//      icon as the first half (a tinted circle glyph, not a big solid dot),
 //      dragged like a rotary dial. Every color's position slides smoothly
 //      and continuously as you drag rather than snapping between slots.
 //
@@ -44,28 +44,33 @@ struct RadialToolMenu: View {
     // MARK: - Geometry (static — pure constants, so callers can position
     // this view without needing an instance).
 
-    static let radius: CGFloat = 120
+    /// Distance from the Pencil tip — unchanged from the last pass.
+    static let radius: CGFloat = 90
     /// Extra breathing room beyond `radius` so icons/dots near the arc's
     /// outer edge aren't clipped by this view's own frame.
     static let margin: CGFloat = 40
     static let sideLength: CGFloat = radius + margin
 
-    private static let startAngle: Double = 90
-    private static let splitAngle: Double = 135
-    private static let endAngle: Double = 180
+    /// 110° sweep (up from a plain 90° quarter circle) — 10° past the
+    /// negative x-axis and 10° past the positive y-axis on each end.
+    private static let startAngle: Double = 170
+    private static let splitAngle: Double = 225
+    private static let endAngle: Double = 280
     private static let visibleColorSlots = 3
 
-    private static let toolIconSize: CGFloat = 13
-    private static let toolHighlightDiameter: CGFloat = 26
+    private static let toolIconSize: CGFloat = 15
+    private static let toolHighlightDiameter: CGFloat = 30
     private static let hitRegionWidth: CGFloat = 40
+    /// Thickness of the translucent grey tube the icons sit on top of.
+    private static let tubeWidth: CGFloat = toolHighlightDiameter + 12
 
     /// The pivot — where the Pencil anchor point sits — is fixed at this
-    /// view's top-right corner; the arc bows down and to the left from there.
-    private static var pivot: CGPoint { CGPoint(x: sideLength, y: 0) }
+    /// view's bottom-right corner; the arc bows up and to the left from there.
+    private static var pivot: CGPoint { CGPoint(x: sideLength, y: sideLength) }
 
     /// Where to `.position()` this view so its pivot lands exactly on `anchor`.
     static func frameCenter(forAnchor anchor: CGPoint) -> CGPoint {
-        CGPoint(x: anchor.x - sideLength / 2, y: anchor.y + sideLength / 2)
+        CGPoint(x: anchor.x - sideLength / 2, y: anchor.y - sideLength / 2)
     }
 
     @State private var committedOffset: Double = 0
@@ -79,10 +84,12 @@ struct RadialToolMenu: View {
 
     var body: some View {
         ZStack {
-            // The palette's only "chrome" — a thin outline tracing the full
-            // arc, no fill behind it.
+            // A translucent grey tube the buttons sit on top of, rather
+            // than bare floating icons.
             arcPath(from: Self.startAngle, to: Self.endAngle)
-                .stroke(Color.secondary.opacity(0.45), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+                .stroke(Color(white: 0.5).opacity(0.38), style: StrokeStyle(lineWidth: Self.tubeWidth, lineCap: .round))
+            arcPath(from: Self.startAngle, to: Self.endAngle)
+                .stroke(Color.white.opacity(0.15), style: StrokeStyle(lineWidth: 1, lineCap: .round))
 
             // Invisible wide hit-region so a drag started anywhere along the
             // bottom half (not just directly on a dot) scrolls the colors.
