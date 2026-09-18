@@ -1,7 +1,7 @@
 import SwiftData
 import Foundation
 
-struct TrussNode: Codable, Identifiable, Sendable {
+nonisolated struct TrussNode: Codable, Identifiable, Sendable {
     var id: UUID = UUID()
     var x: Double
     var y: Double
@@ -10,14 +10,14 @@ struct TrussNode: Codable, Identifiable, Sendable {
     var isFloor:  Bool = false   // part of the built-in road beam (cannot be erased)
 }
 
-struct TrussMember: Codable, Identifiable, Sendable {
+nonisolated struct TrussMember: Codable, Identifiable, Sendable {
     var id: UUID = UUID()
     var startID: UUID
     var endID: UUID
     var isFloor: Bool = false    // part of the built-in road beam (cannot be erased)
 }
 
-struct TrussLoad: Codable, Identifiable, Sendable {
+nonisolated struct TrussLoad: Codable, Identifiable, Sendable {
     var id: UUID = UUID()
     var nodeID: UUID
     var fy: Double       // positive = downward (canvas coords)

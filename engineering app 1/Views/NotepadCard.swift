@@ -128,18 +128,43 @@ struct NotepadThumbnail: View {
               let drawing = try? PKDrawing(data: page.drawingData),
               !drawing.bounds.isEmpty else { return nil }
         let bounds = drawing.bounds.insetBy(dx: -12, dy: -12)
-        // Render through PKDrawing's own dark/light-aware draw(in:...) rather
-        // than the plain image(from:scale:) — that overload always renders
-        // adaptive black/white ink as if against a light background, which
-        // flips strokes the user drew in white (on dark paper) to black.
-        let isDark = PaperTheme.isDarkPaper(hex: notepad.paperColorHex)
-        UIGraphicsBeginImageContextWithOptions(bounds.size, false, 1)
-        defer { UIGraphicsEndImageContext() }
-        guard let ctx = UIGraphicsGetCurrentContext() else { return nil }
-        await drawing.draw(in: ctx, frame: CGRect(origin: .zero, size: bounds.size),
-                            from: bounds, darkUserInterfaceStyle: isDark)
-        guard let rendered = UIGraphicsGetImageFromCurrentImageContext() else { return nil }
-        return Image(uiImage: rendered)
+
+        // PencilCanvasView always draws with the canvas forced to
+        // `.light` (see its top-of-file comment), and every ink color it
+        // hands PencilKit is a fixed, non-adaptive UIColor resolved under
+        // that same light trait collection. PKDrawing's own dark/light-aware
+        // draw(in:...:darkUserInterfaceStyle:) still special-cases literal
+        // black/white ink and will flip it (e.g. white → black) whenever the
+        // flag doesn't match the interface style the stroke was created
+        // under. Rendering here must therefore always pass `false` — the
+        // paper's own color has nothing to do with that flag — so a stroke
+        // renders in the exact color the user picked, whatever it is.
+        //
+        // The legacy UIGraphicsBeginImageContext/EndImageContext globals are
+        // avoided here on purpose: they push/pop a *shared* context stack,
+        // which isn't safe to hold across the `await` below (another task
+        // could touch that same global stack while this one is suspended).
+        // A CGContext we own directly has no such risk.
+        let width  = max(1, Int(bounds.width.rounded(.up)))
+        let height = max(1, Int(bounds.height.rounded(.up)))
+        guard let cgContext = CGContext(
+            data: nil, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        // PencilKit's draw(in:...) expects a UIKit-style (top-left origin,
+        // y-down) context, but a manually created CGContext defaults to the
+        // Core Graphics convention (bottom-left origin, y-up) — flip it.
+        cgContext.translateBy(x: 0, y: CGFloat(height))
+        cgContext.scaleBy(x: 1, y: -1)
+
+        await drawing.draw(in: cgContext,
+                            frame: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)),
+                            from: bounds, darkUserInterfaceStyle: false)
+
+        guard let cgImage = cgContext.makeImage() else { return nil }
+        return Image(uiImage: UIImage(cgImage: cgImage))
     }
     #else
     private static func renderThumbnail(for notepad: Notepad) async -> Image? { nil }
