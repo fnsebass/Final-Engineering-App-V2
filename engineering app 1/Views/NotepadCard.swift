@@ -116,57 +116,70 @@ struct NotepadThumbnail: View {
             }
             .clipShape(RoundedRectangle(cornerRadius: 12))
             .task(id: notepad.persistentModelID) {
-                image = await Self.renderThumbnail(for: notepad)
+                guard let page = notepad.orderedPages.first, !page.drawingData.isEmpty else {
+                    image = nil
+                    return
+                }
+                image = await Self.renderThumbnail(from: page.drawingData)
             }
     }
 
     private var paperColor: Color { PaperTheme.color(fromHex: notepad.paperColorHex) }
 
     #if os(iOS)
-    private static func renderThumbnail(for notepad: Notepad) async -> Image? {
-        guard let page = notepad.orderedPages.first, !page.drawingData.isEmpty,
-              let drawing = try? PKDrawing(data: page.drawingData),
-              !drawing.bounds.isEmpty else { return nil }
-        let bounds = drawing.bounds.insetBy(dx: -12, dy: -12)
+    private static func renderThumbnail(from data: Data) async -> Image? {
+        // PKDrawing.draw(in:...) is `nonisolated(nonsending)`, meaning it
+        // runs on whatever actor calls it rather than hopping to a
+        // background thread on its own. Called directly from the view's
+        // `.task` (main actor), it would decode and rasterize every visible
+        // note's ink synchronously on the main thread — a visible stutter
+        // when Home's grid shows many cards at once (e.g. right after
+        // leaving a note). Running it inside a detached task keeps that
+        // work off the main actor entirely.
+        let uiImage: UIImage? = await Task.detached(priority: .userInitiated) {
+            guard let drawing = try? PKDrawing(data: data), !drawing.bounds.isEmpty else { return nil }
+            let bounds = drawing.bounds.insetBy(dx: -12, dy: -12)
 
-        // PencilCanvasView always draws with the canvas forced to
-        // `.light` (see its top-of-file comment), and every ink color it
-        // hands PencilKit is a fixed, non-adaptive UIColor resolved under
-        // that same light trait collection. PKDrawing's own dark/light-aware
-        // draw(in:...:darkUserInterfaceStyle:) still special-cases literal
-        // black/white ink and will flip it (e.g. white → black) whenever the
-        // flag doesn't match the interface style the stroke was created
-        // under. Rendering here must therefore always pass `false` — the
-        // paper's own color has nothing to do with that flag — so a stroke
-        // renders in the exact color the user picked, whatever it is.
-        //
-        // The legacy UIGraphicsBeginImageContext/EndImageContext globals are
-        // avoided here on purpose: they push/pop a *shared* context stack,
-        // which isn't safe to hold across the `await` below (another task
-        // could touch that same global stack while this one is suspended).
-        // A CGContext we own directly has no such risk.
-        let width  = max(1, Int(bounds.width.rounded(.up)))
-        let height = max(1, Int(bounds.height.rounded(.up)))
-        guard let cgContext = CGContext(
-            data: nil, width: width, height: height,
-            bitsPerComponent: 8, bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-        // PencilKit's draw(in:...) expects a UIKit-style (top-left origin,
-        // y-down) context, but a manually created CGContext defaults to the
-        // Core Graphics convention (bottom-left origin, y-up) — flip it.
-        cgContext.translateBy(x: 0, y: CGFloat(height))
-        cgContext.scaleBy(x: 1, y: -1)
+            // PencilCanvasView always draws with the canvas forced to
+            // `.light` (see its top-of-file comment), and every ink color it
+            // hands PencilKit is a fixed, non-adaptive UIColor resolved under
+            // that same light trait collection. PKDrawing's own dark/light-aware
+            // draw(in:...:darkUserInterfaceStyle:) still special-cases literal
+            // black/white ink and will flip it (e.g. white → black) whenever the
+            // flag doesn't match the interface style the stroke was created
+            // under. Rendering here must therefore always pass `false` — the
+            // paper's own color has nothing to do with that flag — so a stroke
+            // renders in the exact color the user picked, whatever it is.
+            //
+            // The legacy UIGraphicsBeginImageContext/EndImageContext globals are
+            // avoided here on purpose: they push/pop a *shared* context stack,
+            // which isn't safe to hold across the `await` below (another task
+            // could touch that same global stack while this one is suspended).
+            // A CGContext we own directly has no such risk.
+            let width  = max(1, Int(bounds.width.rounded(.up)))
+            let height = max(1, Int(bounds.height.rounded(.up)))
+            guard let cgContext = CGContext(
+                data: nil, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return nil }
+            // PencilKit's draw(in:...) expects a UIKit-style (top-left origin,
+            // y-down) context, but a manually created CGContext defaults to the
+            // Core Graphics convention (bottom-left origin, y-up) — flip it.
+            cgContext.translateBy(x: 0, y: CGFloat(height))
+            cgContext.scaleBy(x: 1, y: -1)
 
-        await drawing.draw(in: cgContext,
-                            frame: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)),
-                            from: bounds, darkUserInterfaceStyle: false)
+            await drawing.draw(in: cgContext,
+                                frame: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)),
+                                from: bounds, darkUserInterfaceStyle: false)
 
-        guard let cgImage = cgContext.makeImage() else { return nil }
-        return Image(uiImage: UIImage(cgImage: cgImage))
+            guard let cgImage = cgContext.makeImage() else { return nil }
+            return UIImage(cgImage: cgImage)
+        }.value
+        return uiImage.map { Image(uiImage: $0) }
     }
     #else
-    private static func renderThumbnail(for notepad: Notepad) async -> Image? { nil }
+    private static func renderThumbnail(from data: Data) async -> Image? { nil }
     #endif
 }
