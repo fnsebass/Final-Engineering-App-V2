@@ -984,17 +984,26 @@ private struct NotepadGridView: View {
                 } else {
                     LazyVGrid(columns: noteColumns, spacing: 20) {
                         ForEach(notepads) { notepad in
-                            Button { onOpen(notepad) } label: {
-                                NotepadCard(notepad: notepad, showDate: showDates)
-                            }
-                            .buttonStyle(.plain)
-                            .draggable(NotepadDrag(id: notepad.persistentModelID))
-                            .contextMenu {
-                                Button { onRename(notepad) } label: { Label("Rename", systemImage: "pencil") }
-                                Button(role: .destructive) { onDelete(notepad) } label: {
-                                    Label("Delete", systemImage: "trash")
+                            // Deliberately not a Button: Button's tap recognizer
+                            // has to negotiate "failure" against the long-press
+                            // recognizers backing both .draggable and .contextMenu
+                            // below, and that three-way arbitration can get a
+                            // specific card's recognizer stuck (permanently
+                            // swallowing taps for that one note, regardless of
+                            // where it later sorts to) after a borderline
+                            // press/drag. A plain tap gesture doesn't have to
+                            // win that negotiation.
+                            NotepadCard(notepad: notepad, showDate: showDates)
+                                .contentShape(Rectangle())
+                                .onTapGesture { onOpen(notepad) }
+                                .accessibilityAddTraits(.isButton)
+                                .draggable(NotepadDrag(id: notepad.persistentModelID))
+                                .contextMenu {
+                                    Button { onRename(notepad) } label: { Label("Rename", systemImage: "pencil") }
+                                    Button(role: .destructive) { onDelete(notepad) } label: {
+                                        Label("Delete", systemImage: "trash")
+                                    }
                                 }
-                            }
                         }
                     }
                 }
