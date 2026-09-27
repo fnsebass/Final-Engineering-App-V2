@@ -15,24 +15,36 @@ enum PaperStyle: String, CaseIterable, Identifiable {
     case grid
     case dots
     case lined
+    /// Ten ruled, checkbox-prefixed lines followed by an "Other Reminders"
+    /// header and continued ruled space. Used only by the permanent
+    /// Reminders notepad (`Notepad.isReminders`) — never offered as a
+    /// regular paper style, so it's excluded from `selectable`.
+    case checklist
 
     var id: String { rawValue }
 
+    /// Paper styles offered in the app's paper-style pickers. `.checklist`
+    /// is deliberately excluded — it's only ever set programmatically for
+    /// the permanent Reminders notepad.
+    static var selectable: [PaperStyle] { allCases.filter { $0 != .checklist } }
+
     var displayName: String {
         switch self {
-        case .blank: return "Blank"
-        case .grid:  return "Grid"
-        case .dots:  return "Dot grid"
-        case .lined: return "Lined"
+        case .blank:     return "Blank"
+        case .grid:      return "Grid"
+        case .dots:      return "Dot grid"
+        case .lined:     return "Lined"
+        case .checklist: return "Checklist"
         }
     }
 
     var systemImage: String {
         switch self {
-        case .blank: return "rectangle"
-        case .grid:  return "grid"
-        case .dots:  return "circle.grid.3x3"
-        case .lined: return "list.bullet.rectangle"
+        case .blank:     return "rectangle"
+        case .grid:      return "grid"
+        case .dots:      return "circle.grid.3x3"
+        case .lined:     return "list.bullet.rectangle"
+        case .checklist: return "checklist"
         }
     }
 }

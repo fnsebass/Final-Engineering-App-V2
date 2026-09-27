@@ -124,7 +124,6 @@ struct CanvasWorkspace: View {
     @State private var canvasResetToken = UUID()
 
     // Photos
-    @State private var selectedPhotoID: PersistentIdentifier? = nil
     @State private var pendingPhotoItems: [PhotosPickerItem] = []
 
     // Pencil squeeze-to-erase state
@@ -165,6 +164,21 @@ struct CanvasWorkspace: View {
             ZStack {
                 // ── Canvas ────────────────────────────────────────────────
                 if let page = notepad.orderedPages.first {
+                    // The paper's own solid backdrop now lives here rather
+                    // than inside PencilCanvasView's grid layer, which had
+                    // to become transparent so photos placed behind it
+                    // aren't hidden by an opaque fill.
+                    PaperTheme.color(fromHex: notepad.paperColorHex)
+                        .ignoresSafeArea()
+
+                    // Photos render BEHIND the ink layer so Pencil strokes
+                    // always draw on top of them — writing continues onto a
+                    // photo the same way it would onto blank paper — and
+                    // deleting a photo never touches the page's ink, since
+                    // that ink is ordinary page-level PKDrawing data, never
+                    // tied to the photo underneath it.
+                    photoLayer(for: page)
+
                     PencilCanvasView(
                         page: page,
                         paperColorHex: notepad.paperColorHex,
@@ -192,10 +206,6 @@ struct CanvasWorkspace: View {
                     )
                     .id(canvasResetToken)
                     .ignoresSafeArea(.container, edges: .bottom)
-
-                    // ── Photo layer (above canvas, below other overlays) ─
-                    photoLayer(for: page)
-                        .zIndex(1)
                 } else {
                     ProgressView("Preparing…").onAppear(perform: ensurePage)
                 }
@@ -364,6 +374,16 @@ struct CanvasWorkspace: View {
                     .transition(.opacity)
                 }
             }
+            // Photo handles (move / delete) — a small fixed hit region per
+            // photo. `.overlay` guarantees these composite (and hit-test)
+            // strictly above PencilCanvasView's UIViewRepresentable-backed
+            // content, which a plain `.zIndex()` isn't reliably honored
+            // against once a UIKit-bridged view is in the mix.
+            .overlay {
+                if let page = notepad.orderedPages.first {
+                    photoHandleLayer(for: page)
+                }
+            }
             .animation(.spring(response: 0.25, dampingFraction: 0.85), value: menuPos != nil)
             .animation(.easeInOut(duration: 0.28), value: showGraph)
             .photosPicker(isPresented: $showPhotoPicker,
@@ -442,16 +462,24 @@ struct CanvasWorkspace: View {
 
     // MARK: - Photo layer
 
+    /// Purely decorative — the images themselves take no touches, so
+    /// Pencil strokes drawn over them reach the ink canvas in front.
     @ViewBuilder
     private func photoLayer(for page: Page) -> some View {
         ForEach(page.photos) { photo in
-            let pid = photo.id
-            PhotoCardView(
-                photo: photo,
-                isSelected: selectedPhotoID == pid,
-                onSelect: { selectedPhotoID = selectedPhotoID == pid ? nil : pid },
-                onDelete: { selectedPhotoID = nil; modelContext.delete(photo) }
-            )
+            PhotoImageView(photo: photo)
+                .allowsHitTesting(false)
+        }
+    }
+
+    /// A direct drag/pinch/rotate/long-press-to-delete grab zone per photo,
+    /// always on top so a photo stays manageable even though its body sits
+    /// behind the ink. Ignores Apple Pencil touches specifically (see
+    /// `PhotoGrabZoneView.hitTest`) so drawing over a photo is unaffected.
+    @ViewBuilder
+    private func photoHandleLayer(for page: Page) -> some View {
+        ForEach(page.photos) { photo in
+            PhotoGrabZone(photo: photo, onDelete: { modelContext.delete(photo) })
         }
     }
 
@@ -784,81 +812,164 @@ private extension Comparable {
     }
 }
 
-// MARK: - Photo card view
+// MARK: - Photo image (decorative — sits behind the ink layer)
 
-private struct PhotoCardView: View {
+/// Just the pixels: no gestures, no hit-testing. Living behind the page's
+/// ink layer means Pencil strokes always render on top of it, and deleting
+/// the photo (via `PhotoGrabZone` below) never touches that ink, since it's
+/// ordinary page-level `PKDrawing` data that was never tied to the photo.
+/// Reads `photo.x/y/width/height/rotationDegrees` directly, so it tracks
+/// live as `PhotoGrabZone`'s gesture recognizers mutate those same
+/// (persisted, non-`@Transient`) properties frame by frame.
+private struct PhotoImageView: View {
     @Bindable var photo: CanvasPhoto
-    let isSelected: Bool
-    let onSelect:  () -> Void
-    let onDelete:  () -> Void
-
-    @GestureState private var dragDelta:  CGSize  = .zero
-    @GestureState private var scaleExtra: CGFloat = 1.0
-    @GestureState private var rotExtra:   Angle   = .zero
 
     private var displayImage: Image? {
         UIImage(data: photo.imageData).map { Image(uiImage: $0) }
     }
 
     var body: some View {
-        ZStack {
-            (displayImage ?? Image(systemName: "photo"))
-                .resizable()
-                .scaledToFill()
-                .frame(width:  photo.width  * scaleExtra,
-                       height: photo.height * scaleExtra)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-                .rotationEffect(.degrees(photo.rotationDegrees) + rotExtra)
-                .overlay {
-                    if isSelected {
-                        RoundedRectangle(cornerRadius: 6)
-                            .strokeBorder(.blue, lineWidth: 2.5)
-                    }
-                }
+        (displayImage ?? Image(systemName: "photo"))
+            .resizable()
+            .scaledToFill()
+            .frame(width: photo.width, height: photo.height)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .rotationEffect(.degrees(photo.rotationDegrees))
+            .position(x: photo.x, y: photo.y)
+    }
+}
 
-            // Delete button (shown when selected)
-            if isSelected {
-                Button(action: onDelete) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.title3)
-                        .foregroundStyle(.white, .red)
-                }
-                .buttonStyle(.plain)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                .offset(x: 12, y: -12)
-            }
+// MARK: - Photo grab zone (move / resize / rotate / delete — above the ink layer)
+
+/// The only hit-testable part of a photo once it sits behind the ink layer.
+/// Drag/pinch/rotate work directly on the photo the instant you touch it —
+/// no reveal step — and a long press offers to delete it. Gestures are
+/// plain UIKit recognizers (`PhotoGrabZoneView` below) rather than SwiftUI's
+/// `Gesture` types so `hitTest` can filter out Apple Pencil touches, which
+/// is not possible to do reliably with SwiftUI's own gesture APIs: Pencil
+/// touches fall straight through to the ink layer behind this view, so
+/// drawing over a photo keeps working, while finger touches are grabbed
+/// here. Each recognizer callback mutates `photo` directly and immediately
+/// (not a local live-preview value), so the visible image — which reads
+/// `photo.x/y/width/height/rotationDegrees` directly — tracks the finger in
+/// real time instead of only snapping into place when the gesture ends.
+private struct PhotoGrabZone: View {
+    @Bindable var photo: CanvasPhoto
+    let onDelete: () -> Void
+
+    @State private var showDeleteConfirm = false
+
+    var body: some View {
+        PhotoGrabZoneRepresentable(
+            onPanDelta: { delta in
+                photo.x += delta.width
+                photo.y += delta.height
+            },
+            onPinchDelta: { scale in
+                photo.width  = max(60, photo.width  * scale)
+                photo.height = max(60, photo.height * scale)
+            },
+            onRotateDelta: { angle in
+                photo.rotationDegrees += angle.degrees
+            },
+            onLongPress: { showDeleteConfirm = true }
+        )
+        .frame(width: photo.width, height: photo.height)
+        .rotationEffect(.degrees(photo.rotationDegrees))
+        .position(x: photo.x, y: photo.y)
+        .alert("Delete this photo?", isPresented: $showDeleteConfirm) {
+            Button("Delete", role: .destructive, action: onDelete)
+            Button("Cancel", role: .cancel) {}
         }
-        .position(x: photo.x + dragDelta.width,
-                  y: photo.y + dragDelta.height)
-        .onTapGesture { onSelect() }
-        .gesture(
-            DragGesture()
-                .updating($dragDelta) { v, state, _ in state = v.translation }
-                .onEnded { v in
-                    photo.x += v.translation.width
-                    photo.y += v.translation.height
-                }
-        )
-        .simultaneousGesture(
-            MagnificationGesture()
-                .updating($scaleExtra) { v, state, _ in state = v }
-                .onEnded { v in
-                    photo.width  = max(60, photo.width  * v)
-                    photo.height = max(60, photo.height * v)
-                }
-        )
-        .simultaneousGesture(
-            RotationGesture()
-                .updating($rotExtra) { v, state, _ in state = v }
-                .onEnded { v in
-                    photo.rotationDegrees += v.degrees
-                }
-        )
-        .contextMenu {
-            Button(role: .destructive, action: onDelete) {
-                Label("Delete Photo", systemImage: "trash")
-            }
+    }
+}
+
+/// UIKit bridge for `PhotoGrabZone`'s gestures. Reports incremental deltas
+/// (not cumulative-since-gesture-start values) so the caller can add them
+/// straight onto the model's current position/size/rotation every callback.
+private struct PhotoGrabZoneRepresentable: UIViewRepresentable {
+    let onPanDelta: (CGSize) -> Void
+    let onPinchDelta: (CGFloat) -> Void
+    let onRotateDelta: (Angle) -> Void
+    let onLongPress: () -> Void
+
+    func makeUIView(context: Context) -> PhotoGrabZoneView {
+        let view = PhotoGrabZoneView()
+        view.backgroundColor = .clear
+
+        let pan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePan(_:)))
+        let pinch = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePinch(_:)))
+        let rotate = UIRotationGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleRotate(_:)))
+        let longPress = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleLongPress(_:)))
+
+        for recognizer in [pan, pinch, rotate, longPress] as [UIGestureRecognizer] {
+            recognizer.delegate = context.coordinator
+            view.addGestureRecognizer(recognizer)
         }
+
+        return view
+    }
+
+    func updateUIView(_ uiView: PhotoGrabZoneView, context: Context) {
+        context.coordinator.onPanDelta = onPanDelta
+        context.coordinator.onPinchDelta = onPinchDelta
+        context.coordinator.onRotateDelta = onRotateDelta
+        context.coordinator.onLongPress = onLongPress
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var onPanDelta: ((CGSize) -> Void)?
+        var onPinchDelta: ((CGFloat) -> Void)?
+        var onRotateDelta: ((Angle) -> Void)?
+        var onLongPress: (() -> Void)?
+
+        @objc func handlePan(_ gr: UIPanGestureRecognizer) {
+            guard gr.state == .changed else { return }
+            let translation = gr.translation(in: gr.view)
+            onPanDelta?(CGSize(width: translation.x, height: translation.y))
+            gr.setTranslation(.zero, in: gr.view)
+        }
+
+        @objc func handlePinch(_ gr: UIPinchGestureRecognizer) {
+            guard gr.state == .changed else { return }
+            onPinchDelta?(gr.scale)
+            gr.scale = 1.0
+        }
+
+        @objc func handleRotate(_ gr: UIRotationGestureRecognizer) {
+            guard gr.state == .changed else { return }
+            onRotateDelta?(.radians(gr.rotation))
+            gr.rotation = 0
+        }
+
+        @objc func handleLongPress(_ gr: UILongPressGestureRecognizer) {
+            guard gr.state == .began else { return }
+            onLongPress?()
+        }
+
+        // Let pan/pinch/rotate all recognize together (a two-finger
+        // pinch-and-rotate is one continuous gesture, not two competing
+        // ones), and don't block the long press from also being possible.
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                                shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            true
+        }
+    }
+}
+
+/// A plain UIView whose only job is hosting the four gesture recognizers
+/// above and filtering touches at the hit-test level: Apple Pencil touches
+/// are declined here so they reach the ink canvas sitting behind this view,
+/// while finger touches are claimed so the gestures above can react to them.
+final class PhotoGrabZoneView: UIView {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        if let touches = event?.allTouches, !touches.isEmpty,
+           touches.allSatisfy({ $0.type == .pencil }) {
+            return nil
+        }
+        return super.hitTest(point, with: event)
     }
 }
 

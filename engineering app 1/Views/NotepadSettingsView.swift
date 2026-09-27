@@ -30,7 +30,7 @@ struct NotepadSettingsView: View {
                 // MARK: - Paper Style Selection
                 Section("Paper Style") {
                     Picker("Style", selection: $notepad.paperStyleRaw) {
-                        ForEach(PaperStyle.allCases) { style in
+                        ForEach(PaperStyle.selectable) { style in
                             Label(style.displayName, systemImage: style.systemImage)
                                 .tag(style.rawValue)
                         }

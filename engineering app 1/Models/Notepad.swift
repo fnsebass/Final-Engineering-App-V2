@@ -65,6 +65,11 @@ final class Notepad {
     /// Surfaced as the "Graphs" section of the notebook side panel.
     var graphHistory: [String] = []
 
+    /// True only for the single permanent "Reminders" notepad reachable from
+    /// Home's sidebar. Excluded from Home's grid and the loose-notes list so
+    /// it doesn't show up as an ordinary, deletable note.
+    var isReminders: Bool = false
+
     init(title: String = "New Note", createdDate: Date = .now) {
         self.title = title
         self.createdDate = createdDate

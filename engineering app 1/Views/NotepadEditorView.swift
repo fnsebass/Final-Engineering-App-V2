@@ -46,6 +46,7 @@ private extension Color {
 
 struct NotepadEditorView: View {
     @Bindable var notepad: Notepad
+    var isSidebarOpen: Bool = true
     var onHome: () -> Void = {}
     var onToggleSidebar: () -> Void = {}
     var onUndoManagerReady: (UndoManager?) -> Void = { _ in }
@@ -241,8 +242,8 @@ struct NotepadEditorView: View {
             .buttonStyle(.plain)
 
             Button(action: onToggleSidebar) {
-                Image(systemName: "sidebar.left")
-                    .font(.system(size: 15, weight: .semibold))
+                Text(isSidebarOpen ? "<" : ">")
+                    .font(.system(size: 17, weight: .semibold))
                     .frame(width: 40, height: 44)
                     .contentShape(Rectangle())
             }

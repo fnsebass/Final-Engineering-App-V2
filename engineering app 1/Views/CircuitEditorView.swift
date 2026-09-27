@@ -106,18 +106,22 @@ struct CircuitEditorView: View {
     @State private var editingComp:    CircuitComponent? = nil
     @State private var valueText = ""
 
-    // AI analysis
+    // AI analysis — a single source of truth so "loading" and "nothing to
+    // show yet" can never be ambiguous or shown at the same time (a prior
+    // two-variable version of this — isAnalyzing + analysisText — left room
+    // for the empty-state copy to render while an analysis was still the
+    // active operation).
+    private enum AnalysisState: Equatable {
+        case idle
+        case loading
+        case result(String)
+        case failed(String)
+    }
     @State private var showAnalysis = false
-    @State private var analysisText = ""
-    @State private var isAnalyzing  = false
+    @State private var analysisState: AnalysisState = .idle
 
     // Animation
     @State private var isAnimating = false
-    // Per-wire current: `forward` = true means flow runs start→end; `share`
-    // is that wire's fraction of the battery's total current (1.0 = carries
-    // it all, as on a plain series run; less on a parallel branch). A wire
-    // absent from this dict isn't on any live + → − path and never animates.
-    @State private var wireFlow: [UUID: WireFlow] = [:]
 
     // Setup sheet (shown on first open when canvas is empty)
     @State private var showSetup    = false
@@ -152,7 +156,6 @@ struct CircuitEditorView: View {
         .sheet(isPresented: $showSetup)       { setupSheet }
         .sheet(isPresented: $showValueEditor) { valueEditorSheet }
         .sheet(isPresented: $showAnalysis)    { analysisSheet }
-        .onChange(of: isAnimating) { _, on in if on { wireFlow = buildFlowDirections() } }
     }
 
     // MARK: - Toolbar (compact: 36 pt, icon-only palette)
@@ -371,16 +374,24 @@ struct CircuitEditorView: View {
             }
             .allowsHitTesting(false)
 
-            // Current-flow animation overlay
+            // Current-flow animation overlay. Flow directions are computed
+            // fresh on every tick (cheap — a small union-find plus a tiny
+            // linear solve) rather than cached in @State: a cached version
+            // of this only refreshed via `.onChange(of: isAnimating)`, so
+            // toggling Animate right after reopening a saved design could
+            // show a stale (often empty) result until some unrelated edit
+            // forced a recompute. Computing it live removes that whole
+            // class of staleness.
             if isAnimating {
                 TimelineView(.animation) { tl in
+                    let currentFlow = buildFlowDirections()
                     Canvas { ctx, _ in
                         let t = tl.date.timeIntervalSinceReferenceDate
                         for wire in wires {
                             // Only wires on a live + → − path have an entry here; skip
                             // everything else so a disconnected negative terminal, a
                             // dead-end branch, or a capacitor-blocked loop never animates.
-                            guard let flow = wireFlow[wire.id] else { continue }
+                            guard let flow = currentFlow[wire.id] else { continue }
                             let a = flow.forward ? wire.start.cgPoint : wire.end.cgPoint
                             let b = flow.forward ? wire.end.cgPoint   : wire.start.cgPoint
                             let len = hypot(b.x - a.x, b.y - a.y)
@@ -631,17 +642,26 @@ struct CircuitEditorView: View {
     private var analysisSheet: some View {
         NavigationStack {
             ScrollView {
-                if isAnalyzing {
+                switch analysisState {
+                case .idle:
+                    Text("Add components with values, then tap Analyze.")
+                        .font(.body)
+                        .padding(20)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                case .loading:
                     VStack(spacing: 16) {
                         ProgressView()
                         Text("Analyzing circuit…")
                             .font(.subheadline).foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity).padding(.top, 60)
-                } else {
-                    Text(analysisText.isEmpty
-                         ? "Add components with values, then tap Analyze."
-                         : analysisText)
+                case .result(let text):
+                    Text(text)
+                        .font(.body)
+                        .padding(20)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                case .failed(let message):
+                    Text(message)
                         .font(.body)
                         .padding(20)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -654,7 +674,7 @@ struct CircuitEditorView: View {
                     Button("Done") { showAnalysis = false }
                 }
                 ToolbarItem(placement: .primaryAction) {
-                    if !isAnalyzing {
+                    if analysisState != .loading {
                         Button { Task { await runAnalysis() } } label: {
                             Image(systemName: "arrow.clockwise")
                         }
@@ -942,12 +962,11 @@ struct CircuitEditorView: View {
     // MARK: - AI: analyse circuit
 
     private func runAnalysis() async {
-        analysisText = ""
-        isAnalyzing  = true
-        showAnalysis = true
+        analysisState = .loading
+        showAnalysis  = true
 
         let snap = components
-        guard !snap.isEmpty else { isAnalyzing = false; return }
+        guard !snap.isEmpty else { analysisState = .idle; return }
 
         let desc = snap.map { c in
             var s = "• \(c.label) (\(c.type.rawValue))"
@@ -956,8 +975,8 @@ struct CircuitEditorView: View {
         }.joined(separator: "\n")
 
         guard isAIAvailable else {
-            analysisText = "On-device AI unavailable.\n\nComponents:\n\(desc)"
-            isAnalyzing = false; return
+            analysisState = .failed("On-device AI unavailable.\n\nComponents:\n\(desc)")
+            return
         }
 
         let instructions = """
@@ -988,12 +1007,13 @@ struct CircuitEditorView: View {
         do {
             let session = LanguageModelSession(instructions: instructions)
             let resp    = try await session.respond(to: "Analyze this circuit:\n\(desc)")
-            analysisText = cleanAnalysisText(resp.content)
+            let cleaned = cleanAnalysisText(resp.content)
+            analysisState = cleaned.isEmpty
+                ? .failed("The AI returned an empty analysis. Tap the refresh button to try again.\n\nCircuit:\n\(desc)")
+                : .result(cleaned)
         } catch {
-            analysisText = "Analysis failed: \(error.localizedDescription)\n\nCircuit:\n\(desc)"
+            analysisState = .failed("Analysis failed: \(error.localizedDescription)\n\nCircuit:\n\(desc)")
         }
-
-        isAnalyzing = false
     }
 
     // Real nodal analysis (Kirchhoff's current law), not a path-guessing

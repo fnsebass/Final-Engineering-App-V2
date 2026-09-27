@@ -23,6 +23,7 @@ enum PaperTheme {
         PaperThemePreset(name: "Cream",     hex: "#FBF3DE"),
         PaperThemePreset(name: "Gray",      hex: "#F2F2F7"),
         PaperThemePreset(name: "Blue Tint", hex: "#EAF2FB"),
+        PaperThemePreset(name: "Blueprint", hex: "#1B3147"),
         PaperThemePreset(name: "Dark",      hex: "#1C1C1E"),
         PaperThemePreset(name: "Black",     hex: "#000000")
     ]

@@ -131,6 +131,7 @@ struct HomeView: View {
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebar
+                .toolbar(removing: .sidebarToggle)
         } detail: {
             detail
         }
@@ -246,6 +247,7 @@ struct HomeView: View {
         } else if let openNotepad {
             NotepadEditorView(
                 notepad: openNotepad,
+                isSidebarOpen: columnVisibility != .detailOnly,
                 onHome: goHome,
                 onToggleSidebar: toggleSidebar,
                 onUndoManagerReady: { canvasUndoManager = $0 },
@@ -268,12 +270,14 @@ struct HomeView: View {
             }
         } else {
             NotepadGridView(
-                notepads: sorted(notepads),
+                notepads: sorted(notepads.filter { !$0.isReminders }),
                 books: recentBooks,
                 showDates: showDates,
+                isSidebarOpen: columnVisibility != .detailOnly,
                 onOpen: open,
                 onOpenBook: { book in withAnimation { selection = .folder(book.persistentModelID) } },
                 onNew: createNotepad,
+                onToggleSidebar: toggleSidebar,
                 onRename: beginRename,
                 onDelete: delete,
                 onRenameBook: beginFolderRename,
@@ -320,7 +324,7 @@ struct HomeView: View {
         } else if openNotepad != nil {
             ChapterSidebarView(
                 book: nil,
-                looseNotes: sorted(notepads.filter { $0.folder == nil }),
+                looseNotes: sorted(notepads.filter { $0.folder == nil && !$0.isReminders }),
                 graphHistory: openNotepad?.graphHistory ?? [],
                 selectedNote: $openNotepad,
                 onHome: goHome,
@@ -452,6 +456,13 @@ struct HomeView: View {
                 Label("Library", systemImage: "books.vertical")
                     .tag(SidebarSelection.library)
                     .listRowBackground(selectionBackground(selection == .library))
+
+                Button(action: openReminders) {
+                    Label("Reminders", systemImage: "checklist")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .listRowBackground(selectionBackground(openNotepad?.isReminders == true, color: homeSelectionColor))
             }
 
             // ── Other Projects – collapsible engineering diagrams ─────────
@@ -654,6 +665,26 @@ struct HomeView: View {
             selection = .folder(folder.persistentModelID)
         }
         openNotepad = notepad
+    }
+
+    /// The single permanent "Reminders" notepad, reached from the sidebar —
+    /// a real, Apple-Pencil-drawable notepad like any other (see
+    /// `PaperStyle.checklist`), just never shown in Home's grid or the
+    /// loose-notes list. Created once and reused from then on.
+    private var remindersNotepad: Notepad {
+        if let existing = notepads.first(where: { $0.isReminders }) { return existing }
+        let created = Notepad(title: "Reminders")
+        created.isReminders = true
+        created.paperStyleRaw = PaperStyle.checklist.rawValue
+        modelContext.insert(created)
+        let firstPage = Page(pageIndex: 0)
+        firstPage.notepad = created
+        modelContext.insert(firstPage)
+        return created
+    }
+
+    private func openReminders() {
+        open(remindersNotepad)
     }
 
     private func goHome() {
@@ -923,9 +954,11 @@ private struct NotepadGridView: View {
     let notepads: [Notepad]
     let books: [Folder]
     let showDates: Bool
+    let isSidebarOpen: Bool
     let onOpen: (Notepad) -> Void
     let onOpenBook: (Folder) -> Void
     let onNew: () -> Void
+    let onToggleSidebar: () -> Void
     let onRename: (Notepad) -> Void
     let onDelete: (Notepad) -> Void
     var onRenameBook: (Folder) -> Void = { _ in }
@@ -994,6 +1027,12 @@ private struct NotepadGridView: View {
         .navigationBarTitleDisplayMode(.inline)
         #endif
         .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button(action: onToggleSidebar) {
+                    Text(isSidebarOpen ? "<" : ">")
+                        .font(.system(size: 17, weight: .semibold))
+                }
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button(action: onNew) { Label("New note", systemImage: "plus") }
             }

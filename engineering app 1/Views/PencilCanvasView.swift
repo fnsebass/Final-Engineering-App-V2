@@ -1078,7 +1078,12 @@ final class GridContentView: UIView {
         case .infinite: pageHeightPt = nil
         }
 
-        backgroundColor          = paper
+        // Transparent, not the paper color: CanvasWorkspace paints the paper
+        // itself as a backdrop behind everything, including photos — this
+        // view (grid lines + whatever ink sits above it) must stay
+        // see-through so an imported photo positioned behind the ink layer
+        // isn't hidden behind an opaque fill here.
+        backgroundColor          = .clear
         isUserInteractionEnabled = false
         setNeedsDisplay()
     }
@@ -1135,6 +1140,56 @@ final class GridContentView: UIView {
                 }
                 y += spacing
             }
+
+            case .checklist:
+                // Ten fixed rows, each a ruled line prefixed by an empty
+                // checkbox square — the user checks one off simply by
+                // drawing a mark through it with the Pencil, same as a
+                // paper checklist. An "Other Reminders" header and
+                // continued ruled lines follow for anything else.
+                let checklistRows = 10
+                let checkboxSize = min(spacing * 0.5, 18)
+                let checkboxInsetX: CGFloat = marginPt > 0 ? marginPt * 0.4 : 12
+
+                for i in 0..<checklistRows {
+                    let lineY = CGFloat(i + 1) * spacing - scrollOffset
+                    guard lineY >= rect.minY - spacing, lineY <= rect.maxY + 0.5 else { continue }
+
+                    ctx.move(to: CGPoint(x: checkboxInsetX + checkboxSize + 8, y: lineY))
+                    ctx.addLine(to: CGPoint(x: bounds.width, y: lineY))
+                    ctx.strokePath()
+
+                    let box = CGRect(x: checkboxInsetX, y: lineY - checkboxSize - 2,
+                                      width: checkboxSize, height: checkboxSize)
+                    ctx.stroke(box)
+                }
+
+                let headerY = CGFloat(checklistRows) * spacing + spacing * 0.6 - scrollOffset
+                if headerY >= rect.minY - 30, headerY <= rect.maxY + 30 {
+                    let attrs: [NSAttributedString.Key: Any] = [
+                        .font: UIFont.boldSystemFont(ofSize: 15),
+                        .foregroundColor: lineColor.withAlphaComponent(1.0)
+                    ]
+                    ("Other Reminders" as NSString).draw(at: CGPoint(x: checkboxInsetX, y: headerY), withAttributes: attrs)
+                }
+
+                // NSString.draw(at:withAttributes:) leaves the context's
+                // stroke color/width in an undefined state, so the
+                // continuation lines below must reassert them explicitly —
+                // otherwise they can render fully opaque instead of the
+                // same faint guide color as the rows above.
+                ctx.setStrokeColor(lineColor.cgColor)
+                ctx.setLineWidth(0.5)
+
+                let bodyStartRow = checklistRows + 2
+                let kBody = max(bodyStartRow, Int(ceil((rect.minY + scrollOffset) / spacing)))
+                var y = CGFloat(kBody) * spacing - scrollOffset
+                while y <= rect.maxY + 0.5 {
+                    ctx.move(to: CGPoint(x: 0, y: y))
+                    ctx.addLine(to: CGPoint(x: bounds.width, y: y))
+                    y += spacing
+                }
+                ctx.strokePath()
             }
         }
 

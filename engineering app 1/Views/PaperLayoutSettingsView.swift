@@ -42,7 +42,7 @@ struct PaperLayoutSettingsView: View {
         Form {
             Section {
                 Picker("Grid Style", selection: $defaultPaperStyleRaw) {
-                    ForEach(PaperStyle.allCases) { style in
+                    ForEach(PaperStyle.selectable) { style in
                         Label(style.displayName, systemImage: style.systemImage)
                             .tag(style.rawValue)
                     }
