@@ -2,12 +2,12 @@ import Foundation
 import SwiftData
 
 @Model final class CanvasPhoto {
-    var imageData: Data
-    var x: Double           // center X in canvas view coordinates
-    var y: Double           // center Y in canvas view coordinates
-    var width: Double
-    var height: Double
-    var rotationDegrees: Double
+    var imageData: Data = Data()
+    var x: Double = 0           // center X in canvas view coordinates
+    var y: Double = 0           // center Y in canvas view coordinates
+    var width: Double = 0
+    var height: Double = 0
+    var rotationDegrees: Double = 0
     var page: Page?
 
     init(imageData: Data, x: Double, y: Double, width: Double, height: Double) {

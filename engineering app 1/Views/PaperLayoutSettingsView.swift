@@ -28,6 +28,7 @@ enum PageDimension: String, CaseIterable, Identifiable {
 struct PaperLayoutSettingsView: View {
     @AppStorage(LayoutPrefs.defaultPaperStyle) private var defaultPaperStyleRaw = PaperStyle.grid.rawValue
     @AppStorage(LayoutPrefs.defaultPaperColorHex) private var defaultPaperColorHex = "#FFFFFF"
+    @AppStorage(LayoutPrefs.defaultGridColumns) private var defaultGridColumns = 16
     @AppStorage("settings.paper.pageDimension") private var pageDimensionRaw = PageDimension.infinite.rawValue
     @AppStorage("settings.paper.margin") private var margin = 24.0
 
@@ -67,6 +68,29 @@ struct PaperLayoutSettingsView: View {
                 ColorPicker("Custom background color", selection: paperColorBinding, supportsOpacity: false)
             } header: {
                 Text("Default Background Color")
+            }
+
+            Section {
+                VStack(spacing: 8) {
+                    Slider(
+                        value: Binding(
+                            get: { Double(defaultGridColumns) },
+                            set: { defaultGridColumns = Int($0.rounded()) }
+                        ),
+                        in: 6...40,
+                        step: 1
+                    )
+
+                    Text("\(defaultGridColumns) boxes per row")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 4)
+            } header: {
+                Text("Default Grid Density")
+            } footer: {
+                Text("Used for every new notepad you create. Higher values mean smaller boxes.")
+                    .font(.caption)
             }
 
             Section {

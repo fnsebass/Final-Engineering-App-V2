@@ -21,6 +21,8 @@ struct NotepadDrag: Transferable, Codable {
 enum SidebarSelection: Hashable {
     case loose
     case library
+    case aiPractice
+    case gradeCalculator
     case folder(PersistentIdentifier)
     case circuit(PersistentIdentifier)
     case fbd(PersistentIdentifier)
@@ -102,18 +104,20 @@ struct HomeView: View {
     @State private var showChapterRenameAlert = false
 
     // Sidebar expand state
-    @State private var specialExpanded       = false
+    @State private var showNewProjectMenu    = false
     @State private var otherProjectsExpanded = false
-    @State private var circuitsExpanded      = true
-    @State private var fbdsExpanded          = true
-    @State private var beamsExpanded         = true
-    @State private var vfsExpanded           = true
-    @State private var trussesExpanded       = true
+    @State private var circuitsExpanded      = false
+    @State private var fbdsExpanded          = false
+    @State private var beamsExpanded         = false
+    @State private var vfsExpanded           = false
+    @State private var trussesExpanded       = false
 
     @AppStorage(LayoutPrefs.showDates)         private var showDates          = true
     @AppStorage(LayoutPrefs.accentRaw)         private var accentRaw          = LayoutAccent.blue.rawValue
     @AppStorage(LayoutPrefs.defaultPaperStyle) private var defaultPaperStyleRaw = PaperStyle.grid.rawValue
     @AppStorage(LayoutPrefs.defaultPaperColorHex) private var defaultPaperColorHex = "#FFFFFF"
+    @AppStorage(LayoutPrefs.defaultGridColumns) private var defaultGridColumns = 16
+    @AppStorage(GeneralPrefs.showRemindersTab) private var showRemindersTab = true
     @AppStorage("isDarkMode")                 private var isDarkMode         = false
     @AppStorage("settings.theme.oledBlack")   private var oledBlack          = false
     @AppStorage("onboarding.completed")       private var onboardingCompleted = false
@@ -262,6 +266,13 @@ struct HomeView: View {
                 },
                 onRenameBook: beginFolderRename
             )
+        } else if selection == .aiPractice {
+            AIPracticeHomeView(
+                practiceSets: sorted(notepads.filter { $0.isAIPractice }),
+                onOpen: open
+            )
+        } else if selection == .gradeCalculator {
+            GradeCalculatorView()
         } else if selectedFolder != nil {
             ContentUnavailableView {
                 Label("Select a Note", systemImage: "doc.text")
@@ -270,7 +281,7 @@ struct HomeView: View {
             }
         } else {
             NotepadGridView(
-                notepads: sorted(notepads.filter { !$0.isReminders }),
+                notepads: sorted(notepads.filter { !$0.isReminders && !$0.isAIPractice }),
                 books: recentBooks,
                 showDates: showDates,
                 isSidebarOpen: columnVisibility != .detailOnly,
@@ -310,6 +321,7 @@ struct HomeView: View {
                 graphHistory: openNotepad?.graphHistory ?? [],
                 selectedNote: $openNotepad,
                 onHome: goHome,
+                onToggleSidebar: toggleSidebar,
                 canUndo: canvasUndoManager != nil,
                 onUndo: { canvasUndoManager?.undo() },
                 onRedo: { canvasUndoManager?.redo() },
@@ -324,10 +336,11 @@ struct HomeView: View {
         } else if openNotepad != nil {
             ChapterSidebarView(
                 book: nil,
-                looseNotes: sorted(notepads.filter { $0.folder == nil && !$0.isReminders }),
+                looseNotes: sorted(notepads.filter { $0.folder == nil && !$0.isReminders && !$0.isAIPractice }),
                 graphHistory: openNotepad?.graphHistory ?? [],
                 selectedNote: $openNotepad,
                 onHome: goHome,
+                onToggleSidebar: toggleSidebar,
                 canUndo: canvasUndoManager != nil,
                 onUndo: { canvasUndoManager?.undo() },
                 onRedo: { canvasUndoManager?.redo() },
@@ -403,37 +416,6 @@ struct HomeView: View {
                 )
             }
 
-            // ── Special – engineering tool creators ───────────────────────
-            DisclosureGroup(isExpanded: $specialExpanded) {
-                Button(action: createCircuit) {
-                    Label("New Circuit", systemImage: "bolt.circle.fill")
-                }
-                .buttonStyle(.plain)
-
-                Button(action: createFBD) {
-                    Label("New FBD", systemImage: "arrow.up.and.down.and.arrow.left.and.right")
-                }
-                .buttonStyle(.plain)
-
-                Button(action: createBeam) {
-                    Label("New Beam", systemImage: "chart.xyaxis.line")
-                }
-                .buttonStyle(.plain)
-
-                Button(action: createVectorField) {
-                    Label("New Vector Field", systemImage: "arrow.clockwise.circle.fill")
-                }
-                .buttonStyle(.plain)
-
-                Button(action: createTruss) {
-                    Label("New Truss", systemImage: "network")
-                }
-                .buttonStyle(.plain)
-            } label: {
-                Label("Special", systemImage: "sparkles")
-                    .fontWeight(.semibold)
-            }
-
             // ── Sort ──────────────────────────────────────────────────────
             Section("Sort by") {
                 Picker("Sort by", selection: $sort) {
@@ -457,16 +439,43 @@ struct HomeView: View {
                     .tag(SidebarSelection.library)
                     .listRowBackground(selectionBackground(selection == .library))
 
-                Button(action: openReminders) {
-                    Label("Reminders", systemImage: "checklist")
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                Label("AI Practice", systemImage: "wand.and.stars")
+                    .tag(SidebarSelection.aiPractice)
+                    .listRowBackground(selectionBackground(selection == .aiPractice))
+
+                Label("Grade Calculator", systemImage: "chart.pie.fill")
+                    .tag(SidebarSelection.gradeCalculator)
+                    .listRowBackground(selectionBackground(selection == .gradeCalculator))
+
+                if showRemindersTab {
+                    Button(action: openReminders) {
+                        Label("Reminders", systemImage: "checklist")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(selectionBackground(openNotepad?.isReminders == true, color: homeSelectionColor))
                 }
-                .buttonStyle(.plain)
-                .listRowBackground(selectionBackground(openNotepad?.isReminders == true, color: homeSelectionColor))
             }
 
             // ── Other Projects – collapsible engineering diagrams ─────────
             DisclosureGroup(isExpanded: $otherProjectsExpanded) {
+
+                // ── Special – engineering tool creators ───────────────────
+                Button {
+                    showNewProjectMenu = true
+                } label: {
+                    Label("Special", systemImage: "sparkles")
+                        .fontWeight(.semibold)
+                }
+                .buttonStyle(.plain)
+                .confirmationDialog("New Project", isPresented: $showNewProjectMenu, titleVisibility: .visible) {
+                    Button("New Circuit") { createCircuit() }
+                    Button("New FBD") { createFBD() }
+                    Button("New Beam") { createBeam() }
+                    Button("New Vector Field") { createVectorField() }
+                    Button("New Truss") { createTruss() }
+                    Button("Cancel", role: .cancel) {}
+                }
 
                 DisclosureGroup(isExpanded: $circuitsExpanded) {
                     ForEach(circuits) { circ in
@@ -634,6 +643,7 @@ struct HomeView: View {
         let notepad = Notepad()
         notepad.paperStyleRaw = defaultPaperStyleRaw
         notepad.paperColorHex = (isDarkMode && oledBlack) ? "#000000" : defaultPaperColorHex
+        notepad.gridColumns = defaultGridColumns
         notepad.folder = selectedFolder
         modelContext.insert(notepad)
         
@@ -708,6 +718,7 @@ struct HomeView: View {
         let notepad = Notepad()
         notepad.paperStyleRaw = defaultPaperStyleRaw
         notepad.paperColorHex = (isDarkMode && oledBlack) ? "#000000" : defaultPaperColorHex
+        notepad.gridColumns = defaultGridColumns
         notepad.assign(to: chapter)
         modelContext.insert(notepad)
 
@@ -979,7 +990,7 @@ private struct NotepadGridView: View {
                     ContentUnavailableView {
                         Label("No Notes", systemImage: "doc")
                     } description: {
-                        Text("Tap + to start a new note.")
+                        Text("Tap New Note in the sidebar to start one.")
                     }
                 } else {
                     LazyVGrid(columns: noteColumns, spacing: 20) {
@@ -1041,9 +1052,6 @@ private struct NotepadGridView: View {
                     Text(isSidebarOpen ? "<" : ">")
                         .font(.system(size: 17, weight: .semibold))
                 }
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Button(action: onNew) { Label("New note", systemImage: "plus") }
             }
         }
     }

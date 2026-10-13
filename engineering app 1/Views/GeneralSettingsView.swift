@@ -11,6 +11,7 @@ enum GeneralPrefs {
     static let language = "settings.general.language"
     static let handedness = "settings.general.handedness"
     static let defaultExportFormat = "settings.general.exportFormat"
+    static let showRemindersTab = "settings.general.showRemindersTab"
 }
 
 enum AppLanguage: String, CaseIterable, Identifiable {
@@ -49,6 +50,7 @@ struct GeneralSettingsView: View {
     @AppStorage(GeneralPrefs.handedness) private var handednessRaw = Handedness.right.rawValue
     @AppStorage(GeneralPrefs.defaultExportFormat) private var exportFormatRaw = ExportFormat.pdf.rawValue
     @AppStorage(LayoutPrefs.showDates) private var showDates = true
+    @AppStorage(GeneralPrefs.showRemindersTab) private var showRemindersTab = true
 
     @State private var didResetOnboarding = false
 
@@ -56,6 +58,13 @@ struct GeneralSettingsView: View {
         Form {
             Section("Card Display") {
                 Toggle("Show edited dates on cards", isOn: $showDates)
+            }
+
+            Section {
+                Toggle("Show Reminders tab", isOn: $showRemindersTab)
+            } footer: {
+                Text("Hides the Reminders entry from the sidebar's Workspace section.")
+                    .font(.caption)
             }
 
             Section {

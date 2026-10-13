@@ -34,12 +34,12 @@ struct FieldSource: Codable, Identifiable {
 
 @Model
 final class VectorFieldDiagram {
-    var title: String
-    var createdDate: Date
-    var fieldTypeRaw: String
-    var sourcesJSON: String
-    var uniformAngle: Double      // degrees (0=right, 90=up)
-    var uniformMagnitude: Double  // display scale 0.1…3
+    var title: String = "New Vector Field"
+    var createdDate: Date = Date()
+    var fieldTypeRaw: String = VectorFieldType.uniform.rawValue
+    var sourcesJSON: String = "[]"
+    var uniformAngle: Double = 0      // degrees (0=right, 90=up)
+    var uniformMagnitude: Double = 1  // display scale 0.1…3
 
     var fieldType: VectorFieldType {
         get { VectorFieldType(rawValue: fieldTypeRaw) ?? .uniform }

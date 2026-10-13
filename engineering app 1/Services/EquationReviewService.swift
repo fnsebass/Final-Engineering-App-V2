@@ -3,12 +3,21 @@
 //  Tolerance
 //
 //  On-device AI over the circled/long-pressed content, using Apple's
-//  Foundation Models framework. Three capabilities:
-//    • review(equation:)     – short free-text review (legacy/fallback)
-//    • reviewSteps(problem:)  – per-step correctness for green/red underlines
-//    • explain(problem:)      – full step-by-step "how to solve it" walkthrough
+//  Foundation Models framework — fully on-device, no network call.
+//
+//  Two families of entry points:
+//    • Image-first (review/explain/checkAlgebra/analyzeChemistry/
+//      extractGraphExpression taking a CGImage) — the model reads the
+//      handwriting photo directly via multimodal Attachment support. This
+//      is the primary path: one on-device inference instead of an OCR pass
+//      followed by a second inference, and the model sees the real strokes
+//      instead of Vision's text guesses.
+//    • Text-based (the same names taking a String) — used only when the
+//      user has manually edited the "Selected Problem" transcription in
+//      AIResultPanel and taps Re-run.
 //
 
+import CoreGraphics
 import Foundation
 import FoundationModels
 
@@ -134,17 +143,75 @@ struct GeneratedChemistryAnalysis {
     var findings: [String]
 }
 
-/// Structured output used by the AI-powered graph expression extractor.
+// MARK: - Image-First Guided-Generation Schemas
+//
+// These mirror the text-based schemas above but are used when the model
+// reads the handwriting photo directly (see "Image-First Implementation"
+// below), so each also returns a `transcription` — a clean typed rendering
+// of what the model read, shown to the user as the editable "Selected
+// Problem" field and reused verbatim if they tap Re-run without editing it.
+
 @Generable
-struct GeneratedGraphExpression {
+struct GeneratedImageReview {
+    @Guide(description: "The problem exactly as handwritten, transcribed into typed math notation using Unicode symbols directly (∫ √ × ² etc). Not the solution — just what's written.")
+    var transcription: String
+
+    @Guide(description: "The review, check, or explanation itself, following the task instructions.")
+    var answer: String
+}
+
+@Generable
+struct GeneratedImageAlgebraicCheck {
+    @Guide(description: "The work exactly as handwritten, transcribed into typed math notation using Unicode symbols directly (∫ √ × ² etc).")
+    var transcription: String
+
+    @Guide(description: "'Correct', 'Contains errors', or 'Partially correct'.")
+    var verdict: String
+
+    @Guide(description: "Each specific mathematical error found, in order of appearance. Empty array if the work is correct.")
+    var errors: [GeneratedMathError]
+}
+
+@Generable
+struct GeneratedImageChemistryAnalysis {
+    @Guide(description: "The problem exactly as handwritten, transcribed into typed notation using Unicode symbols directly (₂ ⁺ → etc).")
+    var transcription: String
+
     @Guide(description: """
-    The right-hand side of the equation as a plottable expression.
+    The main result: balanced equation with integer coefficients, oxidation states, \
+    electron count, or computed value. Use standard chemistry notation. \
+    Example: '2H₂ + O₂ → 2H₂O' or 'Fe: +3, O: −2'. One line where possible.
+    """)
+    var result: String
+
+    @Guide(description: """
+    Short label for what was analyzed. \
+    Examples: 'Combustion reaction', 'Redox / electron transfer', \
+    'Oxidation state analysis', 'Acid-base neutralization', \
+    'Electron configuration', 'Stoichiometry calculation'.
+    """)
+    var analysisType: String
+
+    @Guide(description: """
+    Key chemistry facts, one per entry (up to 5). \
+    Examples: 'Electrons transferred: 2 per Fe atom', \
+    'Molar mass H₂O: 18 g/mol', 'Reaction is exothermic (ΔH < 0)', \
+    'Net ionic: H⁺ + OH⁻ → H₂O', 'Limiting reagent: O₂'. \
+    Empty array if none apply.
+    """)
+    var findings: [String]
+}
+
+@Generable
+struct GeneratedImageGraphExpression {
+    @Guide(description: "The equation exactly as handwritten, transcribed into typed math notation using Unicode symbols directly.")
+    var transcription: String
+
+    @Guide(description: """
+    The right-hand side of the equation as a plottable expression. \
     Use ONLY: x and y as variables; +, -, *, /, ^ as operators; \
-    sin(), cos(), tan(), sqrt(), exp(), log(), ln(), abs() as functions.
-    Fix common OCR artifacts before returning: \
-    'sqr(' → 'sqrt(', 'x2' → 'x^2', 'y2' → 'y^2', a leading '2 =' or 'Z =' likely means 'z ='.
-    Examples: 'z = cos(sqrt(x^2 + y^2))' → 'cos(sqrt(x^2+y^2))'; \
-    'y= x2+1' → 'x^2+1'; '2 = cos(sqr(x 2 + y 2))' → 'cos(sqrt(x^2+y^2))'.
+    sin(), cos(), tan(), sqrt(), exp(), log(), ln(), abs() as functions. \
+    Example: 'z = cos(√(x²+y²))' → 'cos(sqrt(x^2+y^2))'. \
     Return empty string if no plottable equation is found.
     """)
     var expression: String
@@ -175,14 +242,27 @@ struct GeneratedStep {
 
 protocol EquationReviewService {
     func availabilityReason() -> String?
+
+    // Text entry points — used when the user has manually edited the
+    // "Selected Problem" transcription and taps Re-run.
     func review(equation: String) async -> AIReviewResult
     func reviewSteps(problem: String) async -> StepReviewResult
     func explain(problem: String) async -> AIReviewResult
     func checkAlgebra(problem: String) async -> AlgebraicCheckResult
     func analyzeChemistry(problem: String) async -> ChemistryResult
-    /// Returns a clean plottable RHS expression extracted from raw OCR text,
-    /// or nil if the model is unavailable or no expression was found.
-    func extractGraphExpression(from rawOCR: String) async -> String?
+
+    // Image-first entry points — the model reads the handwriting photo
+    // directly instead of going through Vision OCR first. Faster (one
+    // on-device inference instead of OCR-then-inference) and more accurate
+    // (the model sees the real glyphs instead of Vision's text guesses).
+    // Each also returns a `transcription` to populate the editable
+    // "Selected Problem" field.
+    func review(image: CGImage) async -> (transcription: String, result: AIReviewResult)
+    func explain(image: CGImage) async -> (transcription: String, result: AIReviewResult)
+    func checkAlgebra(image: CGImage) async -> (transcription: String, result: AlgebraicCheckResult)
+    func analyzeChemistry(image: CGImage) async -> (transcription: String, result: ChemistryResult)
+    /// Returns nil if the model is unavailable or no plottable expression was found.
+    func extractGraphExpression(from image: CGImage) async -> (transcription: String, expression: String)?
 }
 
 extension EquationReviewService {
@@ -325,23 +405,6 @@ struct OnDeviceEquationReviewService: EquationReviewService {
 
     Always confirm if an equation is already balanced. Show key steps in the findings.
     Never refuse — give your best chemical interpretation even if the input is ambiguous.
-    """
-
-    private let graphExtractInstructions = """
-    You extract the right-hand side of a mathematical equation from OCR text captured \
-    from handwritten notes. The OCR may contain artifacts — correct them before extracting:
-    • 'z' misread as '2' or 'Z' on the left of '=' → still means z = f(x,y)
-    • 'sqr(' or 'S(' → sqrt(
-    • digits glued to variables ('x2', 'y2') → x^2, y^2
-    • Unicode superscripts (², ³) → ^2, ^3
-    • SQUARE ROOT √: handwritten radical sign (checkmark + overbar) reads as \
-      'V', 'v', or '\\/' before the radicand. 'V(x2+y2)', 'vx^2+y^2', \
-      '\\/x2+y2' all mean sqrt(x^2+y^2). Any 'V' or 'v' directly before a \
-      parenthesised or superscript expression should be read as sqrt().
-
-    Return ONLY the RHS expression using: x, y (variables); +, -, *, /, ^ (operators); \
-    sin(), cos(), tan(), sqrt(), exp(), log(), ln(), abs() (functions). \
-    If no plottable equation exists, return an empty string and nothing else.
     """
 
     private let explainInstructionsBase = """
@@ -554,25 +617,6 @@ struct OnDeviceEquationReviewService: EquationReviewService {
         }
     }
 
-    func extractGraphExpression(from rawOCR: String) async -> String? {
-        guard let trimmed = prepared(rawOCR) else { return nil }
-        guard availabilityReason() == nil else { return nil }
-        return await Task.detached(priority: .userInitiated) {
-            do {
-                let session = LanguageModelSession(instructions: graphExtractInstructions)
-                let response = try await session.respond(
-                    to: "OCR text: \(trimmed)",
-                    generating: GeneratedGraphExpression.self
-                )
-                let expr = response.content.expression
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                return expr.isEmpty ? nil : expr
-            } catch {
-                return nil
-            }
-        }.value
-    }
-
     /// Trims and returns the input, or nil if it's empty.
     private func prepared(_ raw: String) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -583,5 +627,195 @@ struct OnDeviceEquationReviewService: EquationReviewService {
     /// that the input is handwriting-OCR output with known symbol artifacts.
     private func ocrPrompt(_ label: String, _ text: String) -> String {
         "\(label) [OCR from handwriting — S/J=∫, d dx=d/dx, oo=∞, apply symbol guide]:\n\(text)"
+    }
+
+    // MARK: - Image-First Implementation
+    //
+    // These read the handwriting photo directly via Foundation Models'
+    // multimodal `Attachment` support rather than going through Vision OCR
+    // first — one on-device inference instead of OCR-then-inference, and
+    // the model sees the real strokes instead of Vision's text guesses.
+
+    /// Shared guidance for interpreting handwriting conventions directly
+    /// from the image — distinct from `ambiguousCharacterGuide` above, which
+    /// is specifically about correcting Vision OCR's text-level mistakes.
+    private static let imageHandwritingGuide = """
+    This is a photo of handwritten engineering/math notes from an iPad. \
+    Handwriting can be messy — apply these conventions: a checkmark with a \
+    bar over the radicand is a square root (√); a fraction bar stacks the \
+    numerator directly above the denominator, so "d" written above "dx" \
+    means d/dx; an integral sign can look like a tall, narrow S or J; \
+    infinity (∞) is a sideways figure-eight; Σ for summation may look like \
+    a sideways 3 or E; Greek letters written quickly can resemble similar \
+    Latin letters (θ like a 0 with a line through it, λ like a lowercase a). \
+    If anything is genuinely ambiguous, infer the most mathematically \
+    sensible reading from context and proceed — never refuse.
+    """
+
+    private var imageReviewInstructions: String {
+        "You are a careful math and engineering tutor reviewing a photo of handwritten notes captured via Apple Pencil.\n\n"
+        + Self.imageHandwritingGuide
+        + "\n\nTranscribe what's written, then solve or check it. Keep your answer concise, but always finish your last sentence completely. Use plain text only — no markdown, no asterisks, no bullet symbols, no dollar signs or backslash-bracket LaTeX notation. Use Unicode math symbols directly (∫ √ × → ≤ ∞ ∂). Flag any error with the specific mistake and correction. Never refuse — always give your best mathematical answer."
+        + tutorPreferenceSuffix
+    }
+
+    private var imageExplainInstructions: String {
+        "You are a patient engineering and math tutor looking at a photo of a student's handwritten notes.\n\n"
+        + Self.imageHandwritingGuide
+        + "\n\nTranscribe the problem, then explain step-by-step HOW to solve it — teach the method so the student can handle similar problems. Number each step. Keep the walkthrough focused, but always finish completely — never cut off mid-step or mid-sentence. Use plain text only — no markdown, no asterisks for bold or italic, no bullet symbols, no dollar signs or backslash-bracket LaTeX notation. Use Unicode math symbols directly (∫ √ × → ≤ ∞ ∂ ²). Cover integration techniques (parts, substitution, partial fractions), derivatives (chain/product/quotient/implicit), limits, differential equations, and engineering calculations. If truly uninterpretable, describe what you see and ask what's needed."
+        + tutorPreferenceSuffix
+    }
+
+    private let imageAlgebraCheckInstructions = """
+    You are a rigorous mathematics checker looking at a photo of handwritten algebraic work.
+
+    \(Self.imageHandwritingGuide)
+
+    Transcribe the work, then check it for:
+    1. Arithmetic errors — wrong computed values (e.g. 3×4 written as 11)
+    2. Sign errors — dropped negatives, wrong inequality direction
+    3. Algebraic manipulation — wrong distribution, incorrect factoring, cancelled terms
+    4. Exponent/power errors — raised to wrong power during a step
+    5. Coefficient/factor errors — missing or extra multipliers
+    6. Order-of-operations mistakes
+    7. Calculus errors — wrong derivative rule applied, missing integration constant, \
+       incorrect limits
+
+    For EACH error found: provide the incorrect expression as written, a short category \
+    label, a specific explanation referencing actual numbers or symbols, and the correction.
+
+    If the work is mathematically correct, set verdict to 'Correct' and return empty errors.
+    """
+
+    private let imageChemistryInstructions = """
+    You are an expert chemistry tutor looking at a photo of handwritten chemistry notes.
+
+    \(Self.imageHandwritingGuide)
+    Chemistry-specific notation: digits following element symbols are subscripts \
+    (H2O = H₂O); "2+"/"2-" after a formula is an ion charge (Ca2+ = Ca²⁺); \
+    "->" or "-->" is a reaction arrow →; "<=>" is equilibrium ⇌.
+
+    Transcribe the problem, then perform whichever analysis applies:
+    1. BALANCE EQUATIONS – find smallest integer coefficients so atoms and charge balance.
+    2. OXIDATION STATES – assign oxidation numbers using standard rules; show each element.
+    3. ELECTRON COUNTING – valence electrons, formal charges, or electrons transferred in redox.
+    4. REACTION TYPE – combustion, acid-base, precipitation, redox, synthesis, decomposition, etc.
+    5. STOICHIOMETRY – molar masses, moles, or limiting reagents when quantities are given.
+    6. OTHER – Lewis structures, hybridisation, bond order, solubility, thermochemistry, kinetics.
+
+    Always confirm if an equation is already balanced. Show key steps in the findings.
+    Never refuse — give your best chemical interpretation even if the input is ambiguous.
+    """
+
+    private let imageGraphExtractInstructions = """
+    You extract a plottable equation from a photo of handwritten notes.
+
+    \(Self.imageHandwritingGuide)
+
+    Transcribe the equation, then return ONLY its right-hand side using: \
+    x, y (variables); +, -, *, /, ^ (operators); \
+    sin(), cos(), tan(), sqrt(), exp(), log(), ln(), abs() (functions). \
+    If no plottable equation exists, return an empty string for the expression.
+    """
+
+    func review(image: CGImage) async -> (transcription: String, result: AIReviewResult) {
+        if let reason = availabilityReason() {
+            return ("", AIReviewResult(state: .modelUnavailable(reason: reason), reviewText: nil))
+        }
+        do {
+            let session = LanguageModelSession(instructions: imageReviewInstructions)
+            let response = try await session.respond(generating: GeneratedImageReview.self) {
+                "Review this handwritten equation or short piece of work."
+                Attachment(image)
+            }
+            let content = response.content
+            return (content.transcription, AIReviewResult(state: .reviewed, reviewText: AITextSanitizer.run(content.answer)))
+        } catch {
+            return ("", AIReviewResult(state: .failed(reason: error.localizedDescription), reviewText: nil))
+        }
+    }
+
+    func explain(image: CGImage) async -> (transcription: String, result: AIReviewResult) {
+        if let reason = availabilityReason() {
+            return ("", AIReviewResult(state: .modelUnavailable(reason: reason), reviewText: nil))
+        }
+        do {
+            let session = LanguageModelSession(instructions: imageExplainInstructions)
+            let response = try await session.respond(generating: GeneratedImageReview.self) {
+                "Identify the problem in this photo, then explain step-by-step how to solve it."
+                Attachment(image)
+            }
+            let content = response.content
+            return (content.transcription, AIReviewResult(state: .reviewed, reviewText: AITextSanitizer.run(content.answer)))
+        } catch {
+            return ("", AIReviewResult(state: .failed(reason: error.localizedDescription), reviewText: nil))
+        }
+    }
+
+    func checkAlgebra(image: CGImage) async -> (transcription: String, result: AlgebraicCheckResult) {
+        if let reason = availabilityReason() {
+            return ("", AlgebraicCheckResult(state: .modelUnavailable(reason: reason), verdict: nil, errors: []))
+        }
+        do {
+            let session = LanguageModelSession(instructions: imageAlgebraCheckInstructions)
+            let response = try await session.respond(generating: GeneratedImageAlgebraicCheck.self) {
+                "Check the math work shown in this photo."
+                Attachment(image)
+            }
+            let c = response.content
+            let errors = c.errors.map { e in
+                MathError(expression: e.expression,
+                          errorType: AITextSanitizer.run(e.errorType),
+                          reason: AITextSanitizer.run(e.reason),
+                          correction: AITextSanitizer.run(e.correction))
+            }
+            let verdict = AITextSanitizer.run(c.verdict)
+            let state: AlgebraicCheckResult.State =
+                verdict.lowercased().contains("error") || !errors.isEmpty
+                ? .hasErrors : .correct
+            return (c.transcription, AlgebraicCheckResult(state: state, verdict: verdict, errors: errors))
+        } catch {
+            return ("", AlgebraicCheckResult(state: .failed(reason: error.localizedDescription), verdict: nil, errors: []))
+        }
+    }
+
+    func analyzeChemistry(image: CGImage) async -> (transcription: String, result: ChemistryResult) {
+        if let reason = availabilityReason() {
+            return ("", ChemistryResult(state: .modelUnavailable(reason: reason), result: nil, analysisType: nil, findings: []))
+        }
+        do {
+            let session = LanguageModelSession(instructions: imageChemistryInstructions)
+            let response = try await session.respond(generating: GeneratedImageChemistryAnalysis.self) {
+                "Analyze the chemistry work shown in this photo."
+                Attachment(image)
+            }
+            let c = response.content
+            let cleanResult   = AITextSanitizer.run(c.result)
+            let cleanType     = AITextSanitizer.run(c.analysisType)
+            let cleanFindings = c.findings.map { AITextSanitizer.run($0) }
+            return (c.transcription, ChemistryResult(state: .reviewed,
+                                   result: cleanResult.isEmpty ? nil : cleanResult,
+                                   analysisType: cleanType.isEmpty ? nil : cleanType,
+                                   findings: cleanFindings))
+        } catch {
+            return ("", ChemistryResult(state: .failed(reason: error.localizedDescription),
+                                   result: nil, analysisType: nil, findings: []))
+        }
+    }
+
+    func extractGraphExpression(from image: CGImage) async -> (transcription: String, expression: String)? {
+        guard availabilityReason() == nil else { return nil }
+        do {
+            let session = LanguageModelSession(instructions: imageGraphExtractInstructions)
+            let response = try await session.respond(generating: GeneratedImageGraphExpression.self) {
+                "Extract the plottable equation from this photo."
+                Attachment(image)
+            }
+            let expr = response.content.expression.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !expr.isEmpty else { return nil }
+            return (response.content.transcription, expr)
+        } catch {
+            return nil
+        }
     }
 }

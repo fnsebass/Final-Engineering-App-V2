@@ -13,11 +13,11 @@ import SwiftData
 @Model
 final class Page {
     /// Position of the page within its notepad (0-based). Used for ordering.
-    var pageIndex: Int
+    var pageIndex: Int = 0
 
     /// Serialized `PKDrawing` (`PKDrawing.dataRepresentation()`). Empty data
     /// represents a blank page.
-    var drawingData: Data
+    var drawingData: Data = Data()
 
     /// The notepad this page belongs to. Set automatically via the inverse
     /// relationship declared on `Notepad.pages`.

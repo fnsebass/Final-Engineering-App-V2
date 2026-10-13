@@ -44,8 +44,9 @@ struct RadialToolMenu: View {
     // MARK: - Geometry (static — pure constants, so callers can position
     // this view without needing an instance).
 
-    /// Distance from the Pencil tip — unchanged from the last pass.
-    static let radius: CGFloat = 90
+    /// Distance from the Pencil tip — widened so the (now 5) tool icons
+    /// along the arc have more room between them and don't crowd together.
+    static let radius: CGFloat = 125
     /// Extra breathing room beyond `radius` so icons/dots near the arc's
     /// outer edge aren't clipped by this view's own frame.
     static let margin: CGFloat = 40
@@ -138,6 +139,7 @@ struct RadialToolMenu: View {
     // MARK: - Tool items
 
     private let toolItems: [(tool: DrawingTool, systemImage: String)] = [
+        (.pen, "pencil"),
         (.eraser, "eraser"),
         (.highlighter, "highlighter"),
         (.straightLine, "line.diagonal"),

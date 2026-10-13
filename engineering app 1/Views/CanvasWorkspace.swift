@@ -67,6 +67,7 @@ struct CanvasWorkspace: View {
 
     @Binding var activeTool: DrawingTool
     @Binding var penColor: Color
+    @Binding var penWidth: Double
     @Binding var rulerActive: Bool
     @Binding var isVerifyMode: Bool
     @Binding var showPhotoPicker: Bool
@@ -79,10 +80,6 @@ struct CanvasWorkspace: View {
     var requestedGraph: String? = nil
     /// Paired with `requestedGraph` — nil = auto-detect, true/false forces the mode.
     var requestedGraphForce3D: Bool? = nil
-
-    // Stored handwriting corrections (applied automatically before every action)
-    @Query(sort: \HandwritingCorrection.useCount, order: .reverse)
-    private var storedCorrections: [HandwritingCorrection]
 
     // Double-tap quick-action menu overlay
     @State private var menuPos: CGPoint? = nil
@@ -117,7 +114,7 @@ struct CanvasWorkspace: View {
 
     // Graph — floating card position & size
     @State private var graphCardCenter: CGPoint? = nil
-    @State private var graphCardWidth: CGFloat = 540
+    @State private var graphCardWidth: CGFloat = 420
 
     // Changing this forces PencilCanvasView to fully tear down and rebuild
     // its PKCanvasView — see the "zombie canvas" fix in canvasViewDrawingDidChange.
@@ -125,6 +122,16 @@ struct CanvasWorkspace: View {
 
     // Photos
     @State private var pendingPhotoItems: [PhotosPickerItem] = []
+    /// The canvas's current vertical scroll, in content-space points — kept
+    /// in sync by PencilCanvasView so the SwiftUI-hosted photo layer can
+    /// convert each photo's stored content-space position into view-space,
+    /// exactly like ink and grid lines already do.
+    @State private var canvasScrollOffset: CGFloat = 0
+    /// True whenever the Apple Pencil is hovering near (or just touched
+    /// down on) the canvas — disables the photo drag/pinch/rotate hit
+    /// region proactively so drawing over a photo can never be mistaken for
+    /// grabbing it. See PencilCanvasView.onPencilProximityChange.
+    @State private var isPencilNearby = false
 
     // Pencil squeeze-to-erase state
     @State private var toolBeforeErase: DrawingTool? = nil
@@ -151,6 +158,12 @@ struct CanvasWorkspace: View {
     /// Tracks the workspace's own size so the floating AIResultPanel's drag
     /// handler can clamp its position without needing a GeometryReader of its own.
     @State private var workspaceSize: CGSize = .zero
+
+    /// True while any floating palette/panel is on screen — see the photo
+    /// handle layer's `.overlay` for why this matters.
+    private var isFloatingOverlayActive: Bool {
+        menuPos != nil || radialPaletteAnchor != nil || showGraph || showPanel || isVerifyMode
+    }
 
     private let reviewService: any EquationReviewService = OnDeviceEquationReviewService()
 
@@ -184,9 +197,13 @@ struct CanvasWorkspace: View {
                         paperColorHex: notepad.paperColorHex,
                         paperStyle: notepad.paperStyle,
                         gridColumns: notepad.gridColumns,
+                        practiceQuestions: AIPracticeGenerator.layout(for: notepad),
+                        photoExclusionRects: page.photos.map(photoExclusionRect),
+                        onScrollOffsetChange: { canvasScrollOffset = $0 },
+                        onPencilProximityChange: { isPencilNearby = $0 },
                         activeTool: $activeTool,
                         penColor: $penColor,
-                        penWidth: 3,
+                        penWidth: penWidth,
                         activeShapeKind: activeShapeKind,
                         onDoubleTapMenu: { pos, image in
                             menuImage = image
@@ -271,7 +288,6 @@ struct CanvasWorkspace: View {
                         equationText: graphEquationText,
                         expression: graphExpression,
                         forceIs3D: graphForce3D,
-                        isPresented: $showGraph,
                         onHeaderDrag: { delta in
                             let oldCenter = graphCardCenter ?? center
                             let hw = graphCardWidth / 2
@@ -279,22 +295,35 @@ struct CanvasWorkspace: View {
                             let newY = (oldCenter.y + delta.height).clamped(to: 60 ... geo.size.height - 60)
                             graphCardCenter = CGPoint(x: newX, y: newY)
                         },
-                        onTopLeftResize: { delta in
-                            // Right edge stays fixed; left edge moves → width changes
-                            let newW = max(300, graphCardWidth - delta.width)
-                            let dw   = graphCardWidth - newW
+                        onWidthDelta: { widthDelta, centerXDelta in
+                            // The child computes both values itself: widthDelta
+                            // flips sign between the left/right handles, but
+                            // centerXDelta (needed to keep the OPPOSITE edge
+                            // anchored) doesn't follow from widthDelta by a
+                            // fixed ratio, so it's passed separately rather
+                            // than derived here.
+                            guard let c = graphCardCenter else { return }
+                            let newW = max(260, graphCardWidth + widthDelta)
+                            let newX = (c.x + centerXDelta).clamped(to: newW / 2 ... geo.size.width - newW / 2)
                             graphCardWidth = newW
-                            // Center shifts right by half the width lost
-                            if let c = graphCardCenter {
-                                let newX = (c.x + dw / 2).clamped(to: newW / 2 ... geo.size.width - newW / 2)
-                                graphCardCenter = CGPoint(x: newX, y: c.y)
-                            }
+                            graphCardCenter = CGPoint(x: newX, y: c.y)
                         }
                     )
                     .frame(width: graphCardWidth)
                     .position(center)
                     .transition(.opacity.combined(with: .scale(scale: 0.96)))
                     .zIndex(8)
+                }
+
+                // Tap anywhere outside the card to dismiss it — the card no
+                // longer has its own close button (the header was replaced
+                // by a plain grab bar), so this is now the only way to close it.
+                if showGraph {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .ignoresSafeArea()
+                        .onTapGesture { withAnimation { showGraph = false } }
+                        .zIndex(7)
                 }
 
                 // ── Live equation-check badge — always top-left of the equation ──
@@ -380,7 +409,16 @@ struct CanvasWorkspace: View {
             // content, which a plain `.zIndex()` isn't reliably honored
             // against once a UIKit-bridged view is in the mix.
             .overlay {
-                if let page = notepad.orderedPages.first {
+                // Suppressed while any floating palette/panel is showing —
+                // since this overlay composites above literally everything
+                // (see comment above), its invisible per-photo hit regions
+                // would otherwise sit on top of and swallow taps meant for
+                // whichever floating UI happens to render over a photo.
+                // Also suppressed whenever the Pencil is nearby, so starting
+                // a stroke on top of a photo always reaches the ink canvas
+                // instead of being mistaken for a grab — see
+                // isPencilNearby/onPencilProximityChange.
+                if let page = notepad.orderedPages.first, !isFloatingOverlayActive, !isPencilNearby {
                     photoHandleLayer(for: page)
                 }
             }
@@ -416,9 +454,9 @@ struct CanvasWorkspace: View {
                 if show && graphCardCenter == nil {
                     graphCardCenter = CGPoint(
                         x: geo.size.width / 2,
-                        y: geo.size.height - 260
+                        y: geo.size.height / 2
                     )
-                    graphCardWidth = min(540, geo.size.width - 32)
+                    graphCardWidth = min(420, geo.size.width - 32)
                 }
                 if !show {
                     graphCardCenter = nil
@@ -467,7 +505,7 @@ struct CanvasWorkspace: View {
     @ViewBuilder
     private func photoLayer(for page: Page) -> some View {
         ForEach(page.photos) { photo in
-            PhotoImageView(photo: photo)
+            PhotoImageView(photo: photo, scrollOffset: canvasScrollOffset)
                 .allowsHitTesting(false)
         }
     }
@@ -479,8 +517,23 @@ struct CanvasWorkspace: View {
     @ViewBuilder
     private func photoHandleLayer(for page: Page) -> some View {
         ForEach(page.photos) { photo in
-            PhotoGrabZone(photo: photo, onDelete: { modelContext.delete(photo) })
+            PhotoGrabZone(photo: photo, scrollOffset: canvasScrollOffset, onDelete: { modelContext.delete(photo) })
         }
+    }
+
+    /// A tight content-space bounding box around a (possibly rotated) photo,
+    /// used only to keep grid/lined/dot lines from being drawn across it.
+    /// Uses the standard rotated-rectangle AABB formula rather than a fixed
+    /// diagonal-sized square — a diagonal square is noticeably larger than
+    /// the photo itself at low rotation (worst case, no rotation at all),
+    /// which looked like a stray untouchable border floating around it.
+    private func photoExclusionRect(for photo: CanvasPhoto) -> CGRect {
+        let radians = photo.rotationDegrees * .pi / 180
+        let cosA = abs(cos(radians)), sinA = abs(sin(radians))
+        let boundingWidth  = photo.width * cosA + photo.height * sinA
+        let boundingHeight = photo.width * sinA + photo.height * cosA
+        return CGRect(x: photo.x - boundingWidth / 2, y: photo.y - boundingHeight / 2,
+                      width: boundingWidth, height: boundingHeight)
     }
 
     // MARK: - Pencil squeeze-to-erase
@@ -584,16 +637,6 @@ struct CanvasWorkspace: View {
         modelContext.insert(page)
     }
 
-    // MARK: - Stored-correction application
-
-    private func applyStoredCorrections(_ text: String) -> String {
-        var result = text
-        for c in storedCorrections where result.contains(c.ocrFragment) {
-            result = result.replacingOccurrences(of: c.ocrFragment, with: c.correctedFragment)
-            c.useCount += 1
-        }
-        return result
-    }
 
     // MARK: - Quick-action handlers (double-tap menu — straight to the AI call)
 
@@ -608,19 +651,17 @@ struct CanvasWorkspace: View {
         guard let image = pendingGraphImage else { return }
         pendingGraphImage = nil
         graphForce3D = force3D
-        Task {
-            let rawOCR    = await EquationOCR.recognize(in: image)
-            let corrected = applyStoredCorrections(rawOCR)
-            await continueGraph(with: corrected)
-        }
+        Task { await continueGraph(with: image) }
     }
 
-    private func continueGraph(with text: String) async {
-        let aiExpr = await reviewService.extractGraphExpression(from: text)
-        let expr   = aiExpr ?? MathEvaluator.extractExpression(from: text) ?? text
-        graphEquationText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        graphExpression   = expr
-        recordGraphHistory(expr)
+    /// Reads the handwriting photo directly — no Vision OCR pass first,
+    /// see EquationReviewService's "Image-First Implementation".
+    private func continueGraph(with image: UIImage) async {
+        guard let cgImage = image.cgImage,
+              let result = await reviewService.extractGraphExpression(from: cgImage) else { return }
+        graphEquationText = result.transcription
+        graphExpression   = result.expression
+        recordGraphHistory(result.expression)
         withAnimation { showGraph = true }
     }
 
@@ -640,13 +681,20 @@ struct CanvasWorkspace: View {
         showPanel = true
         isAnalyzing = true
         resetPanelState()
-        Task {
-            let rawOCR    = await EquationOCR.recognize(in: image)
-            let corrected = applyStoredCorrections(rawOCR)
-            await continueChemistry(with: corrected)
-        }
+        guard let cgImage = image.cgImage else { isAnalyzing = false; return }
+        Task { await continueChemistry(withImage: cgImage) }
     }
 
+    /// Reads the handwriting photo directly — no Vision OCR pass first,
+    /// see EquationReviewService's "Image-First Implementation".
+    private func continueChemistry(withImage image: CGImage) async {
+        let (transcription, result) = await reviewService.analyzeChemistry(image: image)
+        recognizedText = transcription
+        chemistryResult = result
+        isAnalyzing = false
+    }
+
+    /// Re-run path, used after the user edits the "Selected Problem" text.
     private func continueChemistry(with text: String) async {
         recognizedText = text
         let result = await reviewService.analyzeChemistry(problem: text)
@@ -666,16 +714,19 @@ struct CanvasWorkspace: View {
         withAnimation(.easeIn(duration: 0.15)) {
             liveCheckBadge = LiveCheckBadge(anchor: pos, status: .checking)
         }
+        guard let cgImage = image.cgImage else {
+            withAnimation { liveCheckBadge = nil }
+            return
+        }
         Task {
-            let rawOCR = await EquationOCR.recognize(in: image)
-            let corrected = applyStoredCorrections(rawOCR)
+            // Reads the handwriting photo directly — no Vision OCR pass
+            // first, see EquationReviewService's "Image-First Implementation".
+            let (transcription, result) = await reviewService.checkAlgebra(image: cgImage)
             guard generation == liveCheckGeneration else { return }
-            guard !corrected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            guard !transcription.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 withAnimation { liveCheckBadge = nil }
                 return
             }
-            let result = await reviewService.checkAlgebra(problem: corrected)
-            guard generation == liveCheckGeneration else { return }
             let status: LiveCheckBadge.Status
             switch result.state {
             case .correct:   status = .correct
@@ -685,7 +736,7 @@ struct CanvasWorkspace: View {
                 return
             }
             withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                liveCheckBadge = LiveCheckBadge(anchor: pos, status: status, recognizedText: corrected)
+                liveCheckBadge = LiveCheckBadge(anchor: pos, status: status, recognizedText: transcription)
             }
         }
     }
@@ -716,32 +767,21 @@ struct CanvasWorkspace: View {
     private func handleAI() {
         guard let image = menuImage else { menuPos = nil; return }
         menuPos = nil; menuImage = nil
-
-        // Send the long-press screenshot directly to Gemini Vision —
-        // no OCR step needed, the model reads the image directly.
-        guard let imageData = image.pngData() else { return }
         panelMode = .explain
         showPanel = true
         isAnalyzing = true
         resetPanelState()
-        recognizedText = "Analyzing with Gemini Vision…"
+        guard let cgImage = image.cgImage else { isAnalyzing = false; return }
         Task {
-            do {
-                let text = try await GeminiVisionService.verify(imageData: imageData)
-                await MainActor.run {
-                    recognizedText = ""
-                    explanation = AIReviewResult(state: .reviewed, reviewText: text)
-                    isAnalyzing = false
-                }
-            } catch {
-                await MainActor.run {
-                    explanation = AIReviewResult(
-                        state: .failed(reason: error.localizedDescription),
-                        reviewText: nil
-                    )
-                    isAnalyzing = false
-                }
-            }
+            // On-device Foundation Models, reading the handwriting photo
+            // directly — see EquationReviewService's "Image-First
+            // Implementation". No network call, no Gemini.
+            let (transcription, result) = aiVerbose
+                ? await reviewService.explain(image: cgImage)
+                : await reviewService.review(image: cgImage)
+            recognizedText = transcription
+            explanation = result
+            isAnalyzing = false
         }
     }
 
@@ -790,9 +830,13 @@ struct CanvasWorkspace: View {
             let w = ui.size.width  * ratio
             let h = ui.size.height * ratio
 
-            // Place at center of visible canvas area with slight random offset
+            // Place at center of visible canvas area with slight random offset.
+            // photo.y is stored in content-space (like ink), so it must
+            // account for however far the page is currently scrolled —
+            // otherwise the photo would land at the wrong page position
+            // the moment you scroll away from where you inserted it.
             let cx = canvasSize.width  / 2 + CGFloat.random(in: -40...40)
-            let cy = canvasSize.height / 2 + CGFloat.random(in: -40...40)
+            let cy = canvasSize.height / 2 + CGFloat.random(in: -40...40) + canvasScrollOffset
 
             let photo = CanvasPhoto(imageData: data, x: cx, y: cy, width: w, height: h)
             if let page = notepad.orderedPages.first {
@@ -823,6 +867,10 @@ private extension Comparable {
 /// (persisted, non-`@Transient`) properties frame by frame.
 private struct PhotoImageView: View {
     @Bindable var photo: CanvasPhoto
+    /// Current canvas vertical scroll — `photo.y` is stored in content-space
+    /// (like ink), so this is subtracted to get where it should actually
+    /// appear on screen right now.
+    let scrollOffset: CGFloat
 
     private var displayImage: Image? {
         UIImage(data: photo.imageData).map { Image(uiImage: $0) }
@@ -835,7 +883,7 @@ private struct PhotoImageView: View {
             .frame(width: photo.width, height: photo.height)
             .clipShape(RoundedRectangle(cornerRadius: 6))
             .rotationEffect(.degrees(photo.rotationDegrees))
-            .position(x: photo.x, y: photo.y)
+            .position(x: photo.x, y: photo.y - scrollOffset)
     }
 }
 
@@ -855,6 +903,11 @@ private struct PhotoImageView: View {
 /// real time instead of only snapping into place when the gesture ends.
 private struct PhotoGrabZone: View {
     @Bindable var photo: CanvasPhoto
+    /// See PhotoImageView — same content-space → view-space conversion.
+    /// Pan/pinch/rotate deltas are added straight onto the stored
+    /// content-space values regardless, since a gesture's delta is the same
+    /// in either coordinate space (they only differ by a constant offset).
+    let scrollOffset: CGFloat
     let onDelete: () -> Void
 
     @State private var showDeleteConfirm = false
@@ -876,7 +929,7 @@ private struct PhotoGrabZone: View {
         )
         .frame(width: photo.width, height: photo.height)
         .rotationEffect(.degrees(photo.rotationDegrees))
-        .position(x: photo.x, y: photo.y)
+        .position(x: photo.x, y: photo.y - scrollOffset)
         .alert("Delete this photo?", isPresented: $showDeleteConfirm) {
             Button("Delete", role: .destructive, action: onDelete)
             Button("Cancel", role: .cancel) {}
@@ -965,8 +1018,13 @@ private struct PhotoGrabZoneRepresentable: UIViewRepresentable {
 /// while finger touches are claimed so the gestures above can react to them.
 final class PhotoGrabZoneView: UIView {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        if let touches = event?.allTouches, !touches.isEmpty,
-           touches.allSatisfy({ $0.type == .pencil }) {
+        // Check just the first touch, matching StraightLineOverlay/ShapeOverlay's
+        // proven pencil-vs-finger check elsewhere in this file. Checking
+        // *every* touch in `event.allTouches` (as this used to) is unreliable:
+        // that set includes every touch active anywhere on screen right now,
+        // not just the one at this point, so an unrelated touch elsewhere
+        // could flip the result either way.
+        if let touch = event?.allTouches?.first, touch.type == .pencil {
             return nil
         }
         return super.hitTest(point, with: event)

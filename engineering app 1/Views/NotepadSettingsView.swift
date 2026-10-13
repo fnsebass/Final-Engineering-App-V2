@@ -28,6 +28,10 @@ struct NotepadSettingsView: View {
         NavigationStack {
             Form {
                 // MARK: - Paper Style Selection
+                // Hidden for AI Practice notepads — switching away would
+                // overwrite the worksheet's typed question layout, and
+                // .aiPractice isn't offered here to switch back to.
+                if !notepad.isAIPractice {
                 Section("Paper Style") {
                     Picker("Style", selection: $notepad.paperStyleRaw) {
                         ForEach(PaperStyle.selectable) { style in
@@ -41,9 +45,10 @@ struct NotepadSettingsView: View {
                         notepad.markEdited()
                     }
                 }
+                }
 
                 // MARK: - Grid / Line Spacing
-                if notepad.paperStyle != .blank {
+                if notepad.paperStyle != .blank && !notepad.isAIPractice {
                     Section("Grid Density") {
                         VStack(spacing: 8) {
                             Slider(

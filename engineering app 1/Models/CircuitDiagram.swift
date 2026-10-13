@@ -10,6 +10,20 @@
 import SwiftData
 import Foundation
 
+// MARK: - Mode
+
+enum CircuitMode: String, Codable, CaseIterable {
+    case analog  = "Analog"
+    case digital = "Digital"
+}
+
+/// Which mode(s) a component type belongs to — drives palette filtering.
+enum CircuitDomain: String, Codable {
+    case analog
+    case digital
+    case shared
+}
+
 // MARK: - Component type
 
 enum CircuitComponentType: String, Codable, CaseIterable {
@@ -23,6 +37,30 @@ enum CircuitComponentType: String, Codable, CaseIterable {
     case voltmeter  = "Voltmeter"
     case ammeter    = "Ammeter"
 
+    // Digital
+    case andGate    = "AND Gate"
+    case orGate     = "OR Gate"
+    case notGate    = "NOT Gate"
+    case nandGate   = "NAND Gate"
+    case norGate    = "NOR Gate"
+    case xorGate    = "XOR Gate"
+    case xnorGate   = "XNOR Gate"
+    case mux2to1    = "Multiplexer"
+    case dFlipFlop  = "D Flip-Flop"
+    case clock      = "Clock"
+
+    var domain: CircuitDomain {
+        switch self {
+        case .resistor, .battery, .capacitor, .inductor, .voltmeter, .ammeter:
+            return .analog
+        case .led, .switchComp, .ground:
+            return .shared
+        case .andGate, .orGate, .notGate, .nandGate, .norGate, .xorGate, .xnorGate,
+             .mux2to1, .dFlipFlop, .clock:
+            return .digital
+        }
+    }
+
     var prefix: String {
         switch self {
         case .resistor:   return "R"
@@ -34,6 +72,9 @@ enum CircuitComponentType: String, Codable, CaseIterable {
         case .ground:     return "GND"
         case .voltmeter:  return "VM"
         case .ammeter:    return "AM"
+        case .andGate, .orGate, .notGate, .nandGate, .norGate, .xorGate, .xnorGate, .mux2to1, .dFlipFlop:
+            return "U"
+        case .clock:      return "CLK"
         }
     }
 
@@ -48,6 +89,9 @@ enum CircuitComponentType: String, Codable, CaseIterable {
         case .ground:     return ""
         case .voltmeter:  return "V"
         case .ammeter:    return "A"
+        case .andGate, .orGate, .notGate, .nandGate, .norGate, .xorGate, .xnorGate, .mux2to1, .dFlipFlop:
+            return ""
+        case .clock:      return "Hz"
         }
     }
 
@@ -62,15 +106,92 @@ enum CircuitComponentType: String, Codable, CaseIterable {
         case .ground:     return "arrow.down.to.line"
         case .voltmeter:  return "gauge"
         case .ammeter:    return "gauge.with.needle"
+        case .andGate:    return "arrow.triangle.merge"
+        case .orGate:     return "arrow.triangle.branch"
+        case .notGate:    return "circle.slash"
+        case .nandGate:   return "arrow.triangle.merge"
+        case .norGate:    return "arrow.triangle.branch"
+        case .xorGate:    return "bolt.horizontal"
+        case .xnorGate:   return "bolt.horizontal.circle"
+        case .mux2to1:    return "arrow.triangle.swap"
+        case .dFlipFlop:  return "memorychip"
+        case .clock:      return "clock"
         }
     }
 
     var hasValue: Bool {
         switch self {
         case .ground, .switchComp: return false
+        case .andGate, .orGate, .notGate, .nandGate, .norGate, .xorGate, .xnorGate, .mux2to1, .dFlipFlop:
+            return false
         default: return true
         }
     }
+
+    /// Pin layout in LOCAL, unrotated coordinates relative to the component
+    /// center. All offsets land exactly on the canvas's 44pt grid (one grid
+    /// unit per offset axis) so wires between adjacent components always
+    /// connect cleanly — the same convention the original two-terminal
+    /// analog parts established (±44 along the body axis).
+    func pins() -> [ComponentPin] {
+        switch self {
+        case .ground:
+            return [ComponentPin(id: "A", localOffset: CGPoint(x: 0, y: -16), role: .bidirectional)]
+
+        case .resistor, .battery, .capacitor, .inductor, .led, .switchComp, .voltmeter, .ammeter:
+            return [
+                ComponentPin(id: "A", localOffset: CGPoint(x: -44, y: 0), role: .bidirectional),
+                ComponentPin(id: "B", localOffset: CGPoint(x: 44, y: 0), role: .bidirectional)
+            ]
+
+        case .notGate:
+            return [
+                ComponentPin(id: "A",   localOffset: CGPoint(x: -44, y: 0), role: .input),
+                ComponentPin(id: "OUT", localOffset: CGPoint(x: 44, y: 0),  role: .output)
+            ]
+
+        case .andGate, .orGate, .nandGate, .norGate, .xorGate, .xnorGate:
+            return [
+                ComponentPin(id: "A",   localOffset: CGPoint(x: -44, y: -44), role: .input),
+                ComponentPin(id: "B",   localOffset: CGPoint(x: -44, y: 44),  role: .input),
+                ComponentPin(id: "OUT", localOffset: CGPoint(x: 44, y: 0),    role: .output)
+            ]
+
+        case .mux2to1:
+            return [
+                ComponentPin(id: "I0",  localOffset: CGPoint(x: -44, y: -44), role: .input),
+                ComponentPin(id: "I1",  localOffset: CGPoint(x: -44, y: 44),  role: .input),
+                ComponentPin(id: "S",   localOffset: CGPoint(x: 0, y: 44),    role: .input),
+                ComponentPin(id: "OUT", localOffset: CGPoint(x: 44, y: 0),    role: .output)
+            ]
+
+        case .dFlipFlop:
+            return [
+                ComponentPin(id: "D",   localOffset: CGPoint(x: -44, y: -44), role: .input),
+                ComponentPin(id: "CLK", localOffset: CGPoint(x: -44, y: 44),  role: .clock),
+                ComponentPin(id: "Q",   localOffset: CGPoint(x: 44, y: -44),  role: .output),
+                ComponentPin(id: "QN",  localOffset: CGPoint(x: 44, y: 44),   role: .output)
+            ]
+
+        case .clock:
+            return [ComponentPin(id: "OUT", localOffset: CGPoint(x: 44, y: 0), role: .output)]
+        }
+    }
+}
+
+// MARK: - Pins (generalized terminal system)
+
+enum PinRole: String, Codable {
+    case input
+    case output
+    case clock
+    case bidirectional
+}
+
+struct ComponentPin: Identifiable {
+    var id: String
+    var localOffset: CGPoint
+    var role: PinRole
 }
 
 // MARK: - Serialisable point (CGPoint is not Codable)
@@ -91,7 +212,7 @@ struct CircuitComponent: Identifiable, Codable {
     var rotation: Double = 0   // 0 / 90 / 180 / 270
     var value: Double?
     var label: String
-    var isClosed: Bool = true  // switch: closed = conducting
+    var isClosed: Bool = true  // switch: closed = conducting (analog) / logic HIGH (digital)
 
     var position: CGPoint { CGPoint(x: x, y: y) }
     var unit: String { type.defaultUnit }
@@ -102,6 +223,17 @@ struct CircuitComponent: Identifiable, Codable {
         if v == v.rounded() && abs(v) < 100_000 { s = "\(Int(v))" }
         else { s = String(format: "%.3g", v) }
         return "\(s)\(unit)"
+    }
+
+    /// Absolute position of one of this component's pins, taking rotation
+    /// into account. Shared by the netlist builder, terminal hit-testing,
+    /// and symbol rendering so there's exactly one source of truth.
+    func pinPosition(_ pin: ComponentPin) -> CGPoint {
+        let r = rotation * .pi / 180
+        let lx = pin.localOffset.x, ly = pin.localOffset.y
+        let rx = lx * cos(r) - ly * sin(r)
+        let ry = lx * sin(r) + ly * cos(r)
+        return CGPoint(x: x + rx, y: y + ry)
     }
 }
 
@@ -117,16 +249,23 @@ struct CircuitWire: Identifiable, Codable {
 
 @Model
 final class CircuitDiagram {
-    var title: String
-    var createdDate: Date
-    var componentsJSON: String
-    var wiresJSON: String
+    var title: String = "New Circuit"
+    var createdDate: Date = Date()
+    var componentsJSON: String = "[]"
+    var wiresJSON: String = "[]"
+    var modeRaw: String = CircuitMode.analog.rawValue
+
+    var mode: CircuitMode {
+        get { CircuitMode(rawValue: modeRaw) ?? .analog }
+        set { modeRaw = newValue.rawValue }
+    }
 
     init(title: String = "New Circuit") {
         self.title          = title
         self.createdDate    = Date()
         self.componentsJSON = "[]"
         self.wiresJSON      = "[]"
+        self.modeRaw        = CircuitMode.analog.rawValue
     }
 
     // MARK: Persistence helpers

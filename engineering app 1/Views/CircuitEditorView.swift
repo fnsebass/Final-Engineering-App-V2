@@ -80,6 +80,40 @@ struct GeneratedCircuitItem {
     var branch: Int
 }
 
+// MARK: - @Generable types for AI digital circuit generation
+
+@Generable
+struct GeneratedDigitalCircuit {
+    @Guide(description: "Every component in the circuit, in index order starting at 0.")
+    var components: [GeneratedDigitalItem]
+    @Guide(description: "Every wire connection between two components' pins.")
+    var connections: [GeneratedDigitalConnection]
+}
+
+@Generable
+struct GeneratedDigitalItem {
+    @Guide(description: """
+    Component type — must be one of exactly:
+    switchComp | led | ground | clock | andGate | orGate | notGate | nandGate | norGate | xorGate | xnorGate | mux2to1 | dFlipFlop
+    """)
+    var type: String
+
+    @Guide(description: "Label such as S1, U1, D1, CLK1")
+    var label: String
+}
+
+@Generable
+struct GeneratedDigitalConnection {
+    @Guide(description: "0-based index into the circuit's components array — the driving/source side of this wire.")
+    var fromIndex: Int
+    @Guide(description: "Pin id on the source component (e.g. OUT, Q, QN, A, B).")
+    var fromPin: String
+    @Guide(description: "0-based index into the circuit's components array — the receiving side of this wire.")
+    var toIndex: Int
+    @Guide(description: "Pin id on the destination component (e.g. A, B, S, I0, I1, D, CLK).")
+    var toPin: String
+}
+
 // MARK: - Main view
 
 struct CircuitEditorView: View {
@@ -123,6 +157,20 @@ struct CircuitEditorView: View {
     // Animation
     @State private var isAnimating = false
 
+    // Digital/Analog mode + palette sidebar
+    @State private var editorMode: CircuitMode = .analog
+    @State private var isPaletteExpanded = false
+
+    // Digital simulation state — advanced on a ~20Hz side-effecting loop
+    // (see `.task(id:)` on the canvas) rather than inside a TimelineView's
+    // rendering closure, since latching flip-flop state is a mutation and
+    // mutating @State during view-body rendering is unsafe. The particle
+    // animation layer only reads these cached values.
+    @State private var flipFlopStates: [UUID: FlipFlopState] = [:]
+    @State private var digitalNetlist  = CircuitNetlist.build(components: [], wires: [])
+    @State private var digitalLevels:  [CircuitNetlist.NodeID: LogicLevel] = [:]
+    @State private var digitalWireStates: [UUID: (level: LogicLevel, forward: Bool)] = [:]
+
     // Setup sheet (shown on first open when canvas is empty)
     @State private var showSetup    = false
     @State private var setupPhase:  SetupPhase = .choice
@@ -144,18 +192,32 @@ struct CircuitEditorView: View {
         VStack(spacing: 0) {
             toolbar
             Divider()
-            circuitCanvas
+            HStack(spacing: 0) {
+                if isPaletteExpanded {
+                    CircuitPaletteSidebar(mode: editorMode, activeType: activePlaceType) { type in
+                        mode = (activePlaceType == type) ? .select : .place(type)
+                    }
+                    Divider()
+                }
+                circuitCanvas
+            }
         }
         .background(Color(red: 0.07, green: 0.08, blue: 0.10))
         .ignoresSafeArea(.container, edges: .bottom)
         .onAppear {
             components = diagram.loadComponents()
             wires      = diagram.loadWires()
+            editorMode = diagram.mode
             if components.isEmpty { showSetup = true }
         }
         .sheet(isPresented: $showSetup)       { setupSheet }
         .sheet(isPresented: $showValueEditor) { valueEditorSheet }
         .sheet(isPresented: $showAnalysis)    { analysisSheet }
+    }
+
+    private var activePlaceType: CircuitComponentType? {
+        if case .place(let t) = mode { return t }
+        return nil
     }
 
     // MARK: - Toolbar (compact: 36 pt, icon-only palette)
@@ -193,16 +255,16 @@ struct CircuitEditorView: View {
 
             vDivider
 
-            // Component palette — icon-only, scrollable
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 0) {
-                    ForEach(CircuitComponentType.allCases, id: \.self) { type in
-                        paletteBtn(type)
-                    }
-                }
-                .padding(.horizontal, 2)
+            // Palette sidebar toggle
+            modeBtn(icon: "sidebar.leading", active: isPaletteExpanded) {
+                isPaletteExpanded.toggle()
             }
-            .frame(maxWidth: 300)
+
+            vDivider
+
+            // Digital / Analog mode toggle
+            modeToggleBtn(.analog, icon: "waveform.path.ecg")
+            modeToggleBtn(.digital, icon: "cpu")
 
             vDivider
 
@@ -224,7 +286,7 @@ struct CircuitEditorView: View {
             // Delete selected
             Button {
                 guard let id = selectedID else { return }
-                components.removeAll { $0.id == id }
+                deleteComponent(id)
                 selectedID = nil
                 saveChanges()
             } label: {
@@ -237,11 +299,12 @@ struct CircuitEditorView: View {
 
             vDivider
 
-            // Animate current flow
+            // Simulate — current-flow animation (analog) or logic-level
+            // evaluation + pulse animation (digital), per editorMode.
             Button {
                 isAnimating.toggle()
             } label: {
-                Label(isAnimating ? "Stop" : "Animate", systemImage: isAnimating ? "stop.fill" : "bolt.fill")
+                Label(isAnimating ? "Stop" : "Simulate", systemImage: isAnimating ? "stop.fill" : "bolt.fill")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(isAnimating ? Color.yellow : Color.secondary)
                     .padding(.horizontal, 8)
@@ -287,20 +350,23 @@ struct CircuitEditorView: View {
         .buttonStyle(.plain)
     }
 
-    private func paletteBtn(_ type: CircuitComponentType) -> some View {
-        let active = { if case .place(let t) = mode { return t == type } else { return false } }()
-        return Button {
-            mode = active ? .select : .place(type)
+    private func modeToggleBtn(_ m: CircuitMode, icon: String) -> some View {
+        Button {
+            guard editorMode != m else { return }
+            editorMode = m
+            diagram.mode = m
+            mode = .select   // a "place" selection from the other mode's palette is no longer valid
+            isAnimating = false
         } label: {
-            Image(systemName: type.sfIcon)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(active ? Color.accentColor : Color.secondary)
-                .frame(width: 30, height: 30)
-                .background(active ? Color.accentColor.opacity(0.13) : Color.clear,
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(editorMode == m ? Color.accentColor : Color.secondary)
+                .frame(width: 28, height: 28)
+                .background(editorMode == m ? Color.accentColor.opacity(0.13) : Color.clear,
                             in: RoundedRectangle(cornerRadius: 6))
         }
         .buttonStyle(.plain)
-        .help(type.rawValue)
+        .help(m.rawValue)
     }
 
     // MARK: - Canvas
@@ -351,77 +417,81 @@ struct CircuitEditorView: View {
                         }
                 )
 
-            // Wires + preview
-            Canvas { ctx, size in
-                // Committed wires
-                var path = Path()
-                for w in wires {
-                    path.move(to: w.start.cgPoint)
-                    path.addLine(to: w.end.cgPoint)
-                }
-                ctx.stroke(path, with: .color(.white),
-                           style: StrokeStyle(lineWidth: 2, lineCap: .round))
+            // Wires + preview — analog (or digital at rest) draw as a single
+            // plain white path; digital while simulating gets per-wire
+            // HIGH/LOW coloring instead (digitalSimulationOverlay below),
+            // so this base layer is skipped in that case.
+            if !(editorMode == .digital && isAnimating) {
+                Canvas { ctx, size in
+                    var path = Path()
+                    for w in wires {
+                        path.move(to: w.start.cgPoint)
+                        path.addLine(to: w.end.cgPoint)
+                    }
+                    ctx.stroke(path, with: .color(.white),
+                               style: StrokeStyle(lineWidth: 2, lineCap: .round))
 
-                // Live wire preview
-                if let anchor = wireAnchor, let tip = wireTip {
-                    var preview = Path()
-                    preview.move(to: anchor)
-                    preview.addLine(to: tip)
-                    ctx.stroke(preview, with: .color(.blue.opacity(0.7)),
-                               style: StrokeStyle(lineWidth: 2, lineCap: .round,
-                                                  dash: [8, 4]))
+                    if let anchor = wireAnchor, let tip = wireTip {
+                        var preview = Path()
+                        preview.move(to: anchor)
+                        preview.addLine(to: tip)
+                        ctx.stroke(preview, with: .color(.blue.opacity(0.7)),
+                                   style: StrokeStyle(lineWidth: 2, lineCap: .round,
+                                                      dash: [8, 4]))
+                    }
                 }
+                .allowsHitTesting(false)
             }
-            .allowsHitTesting(false)
 
-            // Current-flow animation overlay. Flow directions are computed
-            // fresh on every tick (cheap — a small union-find plus a tiny
-            // linear solve) rather than cached in @State: a cached version
-            // of this only refreshed via `.onChange(of: isAnimating)`, so
-            // toggling Animate right after reopening a saved design could
-            // show a stale (often empty) result until some unrelated edit
-            // forced a recompute. Computing it live removes that whole
-            // class of staleness.
+            // Current-flow / logic-level animation overlay. Both are
+            // computed fresh rather than cached: a cached version only
+            // refreshed via `.onChange(of: isAnimating)` could show a stale
+            // (often empty) result right after reopening a saved design,
+            // until some unrelated edit forced a recompute.
             if isAnimating {
-                TimelineView(.animation) { tl in
-                    let currentFlow = buildFlowDirections()
-                    Canvas { ctx, _ in
-                        let t = tl.date.timeIntervalSinceReferenceDate
-                        for wire in wires {
-                            // Only wires on a live + → − path have an entry here; skip
-                            // everything else so a disconnected negative terminal, a
-                            // dead-end branch, or a capacitor-blocked loop never animates.
-                            guard let flow = currentFlow[wire.id] else { continue }
-                            let a = flow.forward ? wire.start.cgPoint : wire.end.cgPoint
-                            let b = flow.forward ? wire.end.cgPoint   : wire.start.cgPoint
-                            let len = hypot(b.x - a.x, b.y - a.y)
-                            guard len > 8 else { continue }
-                            // Denser, faster, brighter dots for a bigger share of the
-                            // total current — a trunk before a parallel split (share
-                            // ≈ 1) reads very differently from a losing branch (share
-                            // close to 0), and every wire in a plain series run shares
-                            // the same value, so they all animate identically.
-                            let share = min(flow.share, 1.0)
-                            let speed = 0.4 + 1.8 * share
-                            let spacing: CGFloat = max(10, 26 - 14 * CGFloat(share))
-                            let phase = CGFloat(t * speed * 55)
-                                .truncatingRemainder(dividingBy: spacing)
-                            var d = phase
-                            while d < len {
-                                let frac = d / len
-                                let px = a.x + (b.x - a.x) * frac
-                                let py = a.y + (b.y - a.y) * frac
-                                let r: CGFloat = 2 + 2 * CGFloat(share)
-                                ctx.fill(
-                                    Path(ellipseIn: CGRect(x: px-r, y: py-r,
-                                                           width: r*2, height: r*2)),
-                                    with: .color(Color.yellow.opacity(0.55 + 0.35 * share))
-                                )
-                                d += spacing
+                if editorMode == .analog {
+                    TimelineView(.animation) { tl in
+                        let currentFlow = buildFlowDirections()
+                        Canvas { ctx, _ in
+                            let t = tl.date.timeIntervalSinceReferenceDate
+                            for wire in wires {
+                                // Only wires on a live + → − path have an entry here; skip
+                                // everything else so a disconnected negative terminal, a
+                                // dead-end branch, or a capacitor-blocked loop never animates.
+                                guard let flow = currentFlow[wire.id] else { continue }
+                                let a = flow.forward ? wire.start.cgPoint : wire.end.cgPoint
+                                let b = flow.forward ? wire.end.cgPoint   : wire.start.cgPoint
+                                let len = hypot(b.x - a.x, b.y - a.y)
+                                guard len > 8 else { continue }
+                                // Denser, faster, brighter dots for a bigger share of the
+                                // total current — a trunk before a parallel split (share
+                                // ≈ 1) reads very differently from a losing branch (share
+                                // close to 0), and every wire in a plain series run shares
+                                // the same value, so they all animate identically.
+                                let share = min(flow.share, 1.0)
+                                let speed = 0.4 + 1.8 * share
+                                let spacing: CGFloat = max(10, 26 - 14 * CGFloat(share))
+                                let phase = CGFloat(t * speed * 55)
+                                    .truncatingRemainder(dividingBy: spacing)
+                                var d = phase
+                                while d < len {
+                                    let frac = d / len
+                                    let px = a.x + (b.x - a.x) * frac
+                                    let py = a.y + (b.y - a.y) * frac
+                                    let r: CGFloat = 2 + 2 * CGFloat(share)
+                                    ctx.fill(
+                                        Path(ellipseIn: CGRect(x: px-r, y: py-r,
+                                                               width: r*2, height: r*2)),
+                                        with: .color(Color.yellow.opacity(0.55 + 0.35 * share))
+                                    )
+                                    d += spacing
+                                }
                             }
                         }
+                        .allowsHitTesting(false)
                     }
-                    .allowsHitTesting(false)
+                } else {
+                    digitalSimulationOverlay
                 }
             }
 
@@ -431,7 +501,8 @@ struct CircuitEditorView: View {
                     component: comp,
                     isSelected: selectedID == comp.id,
                     isWireMode: mode == .wire,
-                    onTerminalTap: { isFirst in handleTerminalTap(on: comp, isFirst: isFirst) }
+                    isLit: isLedLit(comp),
+                    onTerminalTap: { pinID in handleTerminalTap(on: comp, pinID: pinID) }
                 )
                     .position(comp.position)
                     .gesture(
@@ -444,7 +515,7 @@ struct CircuitEditorView: View {
                     )
                     .onTapGesture {
                         if case .erase = mode {
-                            components.removeAll { $0.id == comp.id }
+                            deleteComponent(comp.id)
                             if selectedID == comp.id { selectedID = nil }
                             saveChanges()
                         } else {
@@ -456,6 +527,8 @@ struct CircuitEditorView: View {
                                             ? "\(Int($0))" : String(format: "%.4g", $0)
                                     } ?? ""
                                     showValueEditor = true
+                                } else if selectedID == comp.id && comp.type == .switchComp {
+                                    toggleSwitch(comp.id)
                                 } else {
                                     selectedID = comp.id == selectedID ? nil : comp.id
                                 }
@@ -468,6 +541,110 @@ struct CircuitEditorView: View {
         .background(Color(red: 0.07, green: 0.08, blue: 0.10))
         .environment(\.colorScheme, .dark)
         .onGeometryChange(for: CGSize.self) { $0.size } action: { canvasSize = $0 }
+    }
+
+    // MARK: - Digital simulation
+
+    /// Colors each wire by its net's logic level and animates traveling
+    /// pulses (output → input) on HIGH nets. The actual logic evaluation —
+    /// including latching flip-flop state on clock edges — is re-run on
+    /// every tick of the same TimelineView driving the particle animation,
+    /// via `.onChange(of: tl.date)`: that's a normal SwiftUI action (not
+    /// part of body rendering), so mutating @State there is safe, unlike
+    /// mutating it directly inside the Canvas closure below.
+    private var digitalSimulationOverlay: some View {
+        TimelineView(.animation) { tl in
+            Canvas { ctx, _ in
+                let t = tl.date.timeIntervalSinceReferenceDate
+                for wire in wires {
+                    let state = digitalWireStates[wire.id]
+                    let level = state?.level ?? .low
+                    let color: Color = level == .high
+                        ? Color(red: 0.25, green: 0.95, blue: 0.55)
+                        : Color(white: 0.35)
+
+                    var path = Path()
+                    path.move(to: wire.start.cgPoint)
+                    path.addLine(to: wire.end.cgPoint)
+                    ctx.stroke(path, with: .color(color), style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
+
+                    guard level == .high, let forward = state?.forward else { continue }
+                    let a = forward ? wire.start.cgPoint : wire.end.cgPoint
+                    let b = forward ? wire.end.cgPoint   : wire.start.cgPoint
+                    let len = hypot(b.x - a.x, b.y - a.y)
+                    guard len > 8 else { continue }
+                    let spacing: CGFloat = 18
+                    let phase = CGFloat(t * 70).truncatingRemainder(dividingBy: spacing)
+                    var d = phase
+                    while d < len {
+                        let frac = d / len
+                        let px = a.x + (b.x - a.x) * frac
+                        let py = a.y + (b.y - a.y) * frac
+                        ctx.fill(Path(ellipseIn: CGRect(x: px - 3, y: py - 3, width: 6, height: 6)),
+                                 with: .color(Color(red: 0.65, green: 1.0, blue: 0.8).opacity(0.9)))
+                        d += spacing
+                    }
+                }
+
+                if let anchor = wireAnchor, let tip = wireTip {
+                    var preview = Path()
+                    preview.move(to: anchor)
+                    preview.addLine(to: tip)
+                    ctx.stroke(preview, with: .color(.blue.opacity(0.7)),
+                               style: StrokeStyle(lineWidth: 2, lineCap: .round, dash: [8, 4]))
+                }
+            }
+            .allowsHitTesting(false)
+            .onChange(of: tl.date) { _, newDate in
+                advanceDigitalSimulation(clockTime: newDate.timeIntervalSinceReferenceDate)
+            }
+            .onAppear {
+                advanceDigitalSimulation(clockTime: tl.date.timeIntervalSinceReferenceDate)
+            }
+        }
+    }
+
+    private func advanceDigitalSimulation(clockTime: Double) {
+        let netlist = CircuitNetlist.build(components: components, wires: wires)
+        let levels = DigitalLogicSimulator.evaluate(
+            components: components, netlist: netlist,
+            clockTime: clockTime,
+            flipFlopStates: &flipFlopStates
+        )
+        digitalNetlist = netlist
+        digitalLevels = levels
+        digitalWireStates = DigitalLogicSimulator.wireStates(
+            components: components, wires: wires, netlist: netlist, levels: levels
+        )
+    }
+
+    /// An LED only lights up in digital mode, and only while simulating —
+    /// analog mode keeps its original always-the-same-look appearance.
+    private func isLedLit(_ comp: CircuitComponent) -> Bool {
+        guard editorMode == .digital, isAnimating, comp.type == .led,
+              let nodes = digitalNetlist.nodeOfPin[comp.id] else { return false }
+        return nodes.values.contains { digitalLevels[$0] == .high }
+    }
+
+    private func toggleSwitch(_ id: UUID) {
+        guard let i = components.firstIndex(where: { $0.id == id }) else { return }
+        components[i].isClosed.toggle()
+        saveChanges()
+    }
+
+    /// Removes a component AND every wire attached to one of its pins —
+    /// otherwise the wire is left dangling at the component's old position,
+    /// which can silently bridge two unrelated nodes together once another
+    /// component is later placed at that same grid point.
+    private func deleteComponent(_ id: UUID) {
+        guard let comp = components.first(where: { $0.id == id }) else { return }
+        let pinPositions = Set(comp.type.pins().map { key(comp.pinPosition($0)) })
+        components.removeAll { $0.id == id }
+        wires.removeAll { pinPositions.contains(key($0.start.cgPoint)) || pinPositions.contains(key($0.end.cgPoint)) }
+    }
+
+    private func key(_ p: CGPoint) -> String {
+        "\(Int(p.x.rounded())),\(Int(p.y.rounded()))"
     }
 
     // MARK: - Setup sheet
@@ -699,6 +876,7 @@ struct CircuitEditorView: View {
                                    label: nextLabel(for: type))
         if type == .battery  { comp.value = 9 }
         if type == .resistor { comp.value = 100 }
+        if type == .clock    { comp.value = 1 }
         components.append(comp)
         selectedID = comp.id
         saveChanges()
@@ -711,26 +889,18 @@ struct CircuitEditorView: View {
         components[i].y = Double(snapped.y)
     }
 
-    /// A component's lead position in canvas space — same ±44/rotation math
-    /// the electrical model in buildFlowDirections already uses, so a wire
-    /// started here lines up exactly with what the current-flow analysis expects.
-    private func terminalPoint(of comp: CircuitComponent, isFirst: Bool) -> CGPoint {
-        if comp.type == .ground {
-            let crad = comp.rotation * .pi / 180
-            return CGPoint(x: comp.x + 16 * sin(crad), y: comp.y - 16 * cos(crad))
-        }
-        let crad = comp.rotation * .pi / 180
-        let sign: Double = isFirst ? -1 : 1
-        return CGPoint(x: comp.x + sign * 44 * cos(crad), y: comp.y + sign * 44 * sin(crad))
-    }
-
     /// Tapping a component's terminal circle to connect a wire — the same
     /// tap-tap chaining TrussEditorView uses for its nodes: first tap sets
     /// the pending anchor (and shows the live dashed preview), second tap
     /// (anywhere — another terminal or a plain grid point) commits the wire.
-    private func handleTerminalTap(on comp: CircuitComponent, isFirst: Bool) {
+    /// `pinID` is one of the component type's `pins()` ids ("A"/"B" for
+    /// two-terminal parts, "OUT"/"CLK"/etc. for digital ones); position is
+    /// resolved via `CircuitComponent.pinPosition(_:)` — the same lookup
+    /// the netlist and digital simulator use.
+    private func handleTerminalTap(on comp: CircuitComponent, pinID: String) {
         guard case .wire = mode else { return }
-        let point = terminalPoint(of: comp, isFirst: isFirst)
+        guard let pin = comp.type.pins().first(where: { $0.id == pinID }) else { return }
+        let point = comp.pinPosition(pin)
         if let anchor = wireAnchor {
             if hypot(anchor.x - point.x, anchor.y - point.y) > 4 {
                 wires.append(CircuitWire(start: CircuitPoint(anchor), end: CircuitPoint(point)))
@@ -831,6 +1001,11 @@ struct CircuitEditorView: View {
 
         guard isAIAvailable else { showSetup = false; return }
 
+        if editorMode == .digital {
+            await generateDigitalFromPrompt()
+            return
+        }
+
         let instructions = """
         You are a circuit schematic assistant. Output a flat list of ALL components in the circuit.
 
@@ -851,6 +1026,43 @@ struct CircuitEditorView: View {
                 generating: GeneratedCircuitLayout.self
             )
             placeGeneratedCircuit(resp.content.components)
+        } catch { }
+
+        showSetup = false
+    }
+
+    private func generateDigitalFromPrompt() async {
+        let instructions = """
+        You are a digital logic schematic assistant. Output every component plus every
+        wire connection between them.
+
+        Use ONLY these type strings: switchComp, led, ground, clock, andGate, orGate, notGate,
+        nandGate, norGate, xorGate, xnorGate, mux2to1, dFlipFlop.
+
+        Every independent binary input must be its own switchComp. Always end with at least
+        one led as the circuit's output. Index components starting at 0 in the order you list
+        them; every connection references those indices.
+
+        Valid pin ids per type:
+          switchComp/led/ground: A, B (ground only has A)
+          notGate: A (input), OUT (output)
+          andGate/orGate/nandGate/norGate/xorGate/xnorGate: A, B (inputs), OUT (output)
+          mux2to1: I0, I1, S (inputs), OUT (output)
+          dFlipFlop: D, CLK (inputs), Q, QN (outputs)
+          clock: OUT (output)
+
+        A connection's "from" side must be an output-capable pin (OUT, Q, QN, or a
+        switchComp/ground terminal); its "to" side must be an input-capable pin
+        (A, B, S, I0, I1, D, CLK, or a switchComp/led terminal).
+        """
+
+        do {
+            let session = LanguageModelSession(instructions: instructions)
+            let resp = try await session.respond(
+                to: "Create this digital logic circuit: \(setupPrompt)",
+                generating: GeneratedDigitalCircuit.self
+            )
+            placeGeneratedDigitalCircuit(resp.content)
         } catch { }
 
         showSetup = false
@@ -952,6 +1164,53 @@ struct CircuitEditorView: View {
             w(jRX + 60, cy, jRX + 60, loopY)
             w(jRX + 60, loopY, firstX, loopY)
             w(firstX, loopY, firstX, cy)
+        }
+
+        components = placed
+        wires      = newWires
+        saveChanges()
+    }
+
+    /// Lays out an AI-generated digital circuit in simple left-to-right
+    /// columns (inputs → gates → output) and wires every connection the
+    /// model specified directly between the two pins' resolved positions —
+    /// those positions already land exactly where CircuitNetlist expects
+    /// them (component.pinPosition(_:)), so the wires connect cleanly
+    /// without needing the manual editor's grid-snap step.
+    private func placeGeneratedDigitalCircuit(_ circuit: GeneratedDigitalCircuit) {
+        let items = circuit.components
+        guard !items.isEmpty else { return }
+
+        let cx = canvasSize.width / 2
+        let cy = canvasSize.height / 2
+        let colStep: CGFloat = 150
+        let rowStep: CGFloat = 110
+        let x0 = cx - colStep * CGFloat(items.count - 1) / 2
+
+        var placed: [CircuitComponent] = []
+        for (i, item) in items.enumerated() {
+            let type = CircuitComponentType.allCases.first {
+                $0.rawValue.lowercased() == item.type.lowercased() || "\($0)".lowercased() == item.type.lowercased()
+            } ?? .switchComp
+            let row = CGFloat(i % 2 == 0 ? 0 : 1) - 0.5
+            let comp = CircuitComponent(
+                type: type,
+                x: Double(x0 + colStep * CGFloat(i)),
+                y: Double(cy + rowStep * row),
+                label: item.label.isEmpty ? diagram.nextLabel(for: type) : item.label
+            )
+            placed.append(comp)
+        }
+
+        var newWires: [CircuitWire] = []
+        for conn in circuit.connections {
+            guard placed.indices.contains(conn.fromIndex), placed.indices.contains(conn.toIndex) else { continue }
+            let from = placed[conn.fromIndex], to = placed[conn.toIndex]
+            guard let fromPin = from.type.pins().first(where: { $0.id == conn.fromPin }),
+                  let toPin   = to.type.pins().first(where: { $0.id == conn.toPin })
+            else { continue }
+            newWires.append(CircuitWire(start: CircuitPoint(from.pinPosition(fromPin)),
+                                        end:   CircuitPoint(to.pinPosition(toPin))))
         }
 
         components = placed
@@ -1198,223 +1457,6 @@ struct CircuitEditorView: View {
             }
         }
         return rhs
-    }
-}
-
-// MARK: - Circuit symbol view
-
-struct CircuitSymbolView: View {
-    let component: CircuitComponent
-    let isSelected: Bool
-    /// Terminal dots only render/respond to taps in wire mode, so they
-    /// never steal a tap meant for select/erase/value-edit the rest of the time.
-    var isWireMode: Bool = false
-    /// Called with `true` for the first/left lead, `false` for the
-    /// second/right lead — nil for Ground, which only has one. The caller
-    /// (CircuitEditorView) computes the actual canvas-space point itself,
-    /// using the same ±44-from-center/rotation math as the electrical model
-    /// in buildFlowDirections, so a tapped terminal always lines up exactly
-    /// with where a wire would snap to.
-    var onTerminalTap: ((Bool) -> Void)? = nil
-
-    private let W: CGFloat = 88
-    private let H: CGFloat = 50
-
-    /// Terminal dots, in this view's own unrotated local coordinates —
-    /// SwiftUI's rotationEffect on the enclosing frame carries them around
-    /// with the drawn symbol automatically. Matches the ±44 electrical
-    /// lead offset from buildFlowDirections, not the ±42 purely-visual
-    /// lead endpoint the Canvas drawer uses (imperceptibly different, but
-    /// keeps the tappable dot exactly on the grid point wires snap to).
-    private var terminalPoints: [(isFirst: Bool, point: CGPoint)] {
-        let cx = W / 2, cy = H / 2
-        if component.type == .ground {
-            return [(true, CGPoint(x: cx, y: cy - 16))]
-        }
-        return [(true, CGPoint(x: cx - 44, y: cy)), (false, CGPoint(x: cx + 44, y: cy))]
-    }
-
-    var body: some View {
-        ZStack {
-            ZStack {
-                Canvas { ctx, size in
-                    CircuitSymbolDrawer.draw(component: component, in: ctx, size: size)
-                }
-
-                if isWireMode {
-                    ForEach(Array(terminalPoints.enumerated()), id: \.offset) { _, term in
-                        Circle()
-                            .fill(Color.cyan.opacity(0.85))
-                            .frame(width: 11, height: 11)
-                            .overlay(Circle().strokeBorder(Color.white.opacity(0.7), lineWidth: 1))
-                            .position(term.point)
-                            .contentShape(Circle())
-                            .onTapGesture { onTerminalTap?(term.isFirst) }
-                    }
-                }
-            }
-            .frame(width: W, height: H)
-            .rotationEffect(.degrees(component.rotation))
-
-            Text(labelText)
-                .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                .foregroundStyle(Color.primary.opacity(0.85))
-                .multilineTextAlignment(.center)
-                .fixedSize()
-                .frame(maxWidth: W + 20)
-                .offset(y: H / 2 + 12)
-        }
-        .frame(width: W + 20, height: H + 30)
-        .overlay {
-            if isSelected {
-                RoundedRectangle(cornerRadius: 6)
-                    .strokeBorder(Color.accentColor.opacity(0.8), lineWidth: 1.5)
-                    .frame(width: W + 12, height: H + 12)
-            }
-        }
-        .contentShape(Rectangle())
-    }
-
-    private var labelText: String {
-        component.value != nil
-            ? "\(component.label): \(component.valueString)"
-            : component.label
-    }
-}
-
-// MARK: - Symbol drawing
-
-enum CircuitSymbolDrawer {
-    static func draw(component: CircuitComponent, in ctx: GraphicsContext, size: CGSize) {
-        let cx = size.width / 2, cy = size.height / 2
-        let tw = size.width / 2 - 2
-
-        switch component.type {
-        case .resistor:   drawResistor(ctx, cx, cy, tw)
-        case .battery:    drawBattery(ctx, cx, cy, tw)
-        case .capacitor:  drawCapacitor(ctx, cx, cy, tw)
-        case .inductor:   drawInductor(ctx, cx, cy, tw)
-        case .led:        drawLED(ctx, cx, cy, tw)
-        case .switchComp: drawSwitch(ctx, cx, cy, tw, closed: component.isClosed)
-        case .ground:     drawGround(ctx, cx, cy)
-        case .voltmeter:  drawMeter(ctx, cx, cy, tw, label: "V")
-        case .ammeter:    drawMeter(ctx, cx, cy, tw, label: "A")
-        }
-    }
-
-    private static let wire = StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round)
-
-    private static func drawResistor(_ ctx: GraphicsContext, _ cx: CGFloat, _ cy: CGFloat, _ tw: CGFloat) {
-        let bw: CGFloat = 28; let bh: CGFloat = 16
-        var leads = Path()
-        leads.move(to: CGPoint(x: cx - tw,   y: cy)); leads.addLine(to: CGPoint(x: cx - bw/2, y: cy))
-        leads.move(to: CGPoint(x: cx + bw/2, y: cy)); leads.addLine(to: CGPoint(x: cx + tw,   y: cy))
-        ctx.stroke(leads, with: .color(Color.primary), style: wire)
-        var box = Path()
-        box.addRect(CGRect(x: cx - bw/2, y: cy - bh/2, width: bw, height: bh))
-        ctx.stroke(box, with: .color(Color.primary), lineWidth: 1.8)
-    }
-
-    private static func drawBattery(_ ctx: GraphicsContext, _ cx: CGFloat, _ cy: CGFloat, _ tw: CGFloat) {
-        let gap: CGFloat = 5; let lh: CGFloat = 22; let sh: CGFloat = 13
-        var p = Path()
-        p.move(to: CGPoint(x: cx - tw,  y: cy)); p.addLine(to: CGPoint(x: cx - gap, y: cy))
-        p.move(to: CGPoint(x: cx + gap, y: cy)); p.addLine(to: CGPoint(x: cx + tw,  y: cy))
-        p.move(to: CGPoint(x: cx - gap, y: cy - lh/2)); p.addLine(to: CGPoint(x: cx - gap, y: cy + lh/2))
-        p.move(to: CGPoint(x: cx + gap, y: cy - sh/2)); p.addLine(to: CGPoint(x: cx + gap, y: cy + sh/2))
-        ctx.stroke(p, with: .color(Color.primary), style: StrokeStyle(lineWidth: 2.0, lineCap: .square))
-        ctx.draw(Text("+").font(.system(size: 9, weight: .bold)).foregroundStyle(Color.primary),
-                 at: CGPoint(x: cx - gap - 8, y: cy - lh/2))
-        ctx.draw(Text("−").font(.system(size: 11, weight: .bold)).foregroundStyle(Color.primary),
-                 at: CGPoint(x: cx + gap + 8, y: cy - sh/2))
-    }
-
-    private static func drawCapacitor(_ ctx: GraphicsContext, _ cx: CGFloat, _ cy: CGFloat, _ tw: CGFloat) {
-        let gap: CGFloat = 5; let ph: CGFloat = 24
-        var p = Path()
-        p.move(to: CGPoint(x: cx - tw,  y: cy)); p.addLine(to: CGPoint(x: cx - gap, y: cy))
-        p.move(to: CGPoint(x: cx + gap, y: cy)); p.addLine(to: CGPoint(x: cx + tw,  y: cy))
-        p.move(to: CGPoint(x: cx - gap, y: cy - ph/2)); p.addLine(to: CGPoint(x: cx - gap, y: cy + ph/2))
-        p.move(to: CGPoint(x: cx + gap, y: cy - ph/2)); p.addLine(to: CGPoint(x: cx + gap, y: cy + ph/2))
-        ctx.stroke(p, with: .color(Color.primary), style: StrokeStyle(lineWidth: 2.0, lineCap: .square))
-    }
-
-    private static func drawInductor(_ ctx: GraphicsContext, _ cx: CGFloat, _ cy: CGFloat, _ tw: CGFloat) {
-        let r: CGFloat = 6; let n = 4
-        let totalW = CGFloat(n) * r * 2; let sx = cx - totalW / 2
-        var p = Path()
-        p.move(to: CGPoint(x: cx - tw, y: cy)); p.addLine(to: CGPoint(x: sx, y: cy))
-        for i in 0..<n {
-            p.addArc(center: CGPoint(x: sx + CGFloat(i) * r * 2 + r, y: cy),
-                     radius: r, startAngle: .degrees(180), endAngle: .degrees(0), clockwise: true)
-        }
-        p.addLine(to: CGPoint(x: cx + tw, y: cy))
-        ctx.stroke(p, with: .color(Color.primary), style: wire)
-    }
-
-    private static func drawLED(_ ctx: GraphicsContext, _ cx: CGFloat, _ cy: CGFloat, _ tw: CGFloat) {
-        let th: CGFloat = 16
-        var leads = Path()
-        leads.move(to: CGPoint(x: cx - tw,   y: cy)); leads.addLine(to: CGPoint(x: cx - th/2, y: cy))
-        leads.move(to: CGPoint(x: cx + th/2, y: cy)); leads.addLine(to: CGPoint(x: cx + tw,   y: cy))
-        leads.move(to: CGPoint(x: cx + th/2, y: cy - th/2))
-        leads.addLine(to: CGPoint(x: cx + th/2, y: cy + th/2))
-        ctx.stroke(leads, with: .color(Color.primary), style: wire)
-        var tri = Path()
-        tri.move(to: CGPoint(x: cx - th/2, y: cy - th/2))
-        tri.addLine(to: CGPoint(x: cx + th/2, y: cy))
-        tri.addLine(to: CGPoint(x: cx - th/2, y: cy + th/2))
-        tri.closeSubpath()
-        ctx.fill(tri, with: .color(.yellow.opacity(0.35)))
-        ctx.stroke(tri, with: .color(Color.primary), lineWidth: 1.6)
-        var arrows = Path()
-        for i in 0..<2 {
-            let d = CGFloat(i) * 5
-            arrows.move(to: CGPoint(x: cx + th/2 + 4 + d, y: cy - th/2 + d))
-            arrows.addLine(to: CGPoint(x: cx + th/2 + 10 + d, y: cy - th/2 - 6 + d))
-        }
-        ctx.stroke(arrows, with: .color(.yellow.opacity(0.9)),
-                   style: StrokeStyle(lineWidth: 1.2, lineCap: .round))
-    }
-
-    private static func drawSwitch(_ ctx: GraphicsContext, _ cx: CGFloat, _ cy: CGFloat,
-                                   _ tw: CGFloat, closed: Bool) {
-        let px: CGFloat = 14; let dr: CGFloat = 2.5
-        var p = Path()
-        p.move(to: CGPoint(x: cx - tw, y: cy)); p.addLine(to: CGPoint(x: cx - px, y: cy))
-        p.move(to: CGPoint(x: cx + px, y: cy)); p.addLine(to: CGPoint(x: cx + tw, y: cy))
-        if closed {
-            p.move(to: CGPoint(x: cx - px, y: cy)); p.addLine(to: CGPoint(x: cx + px, y: cy))
-        } else {
-            p.move(to: CGPoint(x: cx - px, y: cy)); p.addLine(to: CGPoint(x: cx + px - 4, y: cy - 14))
-        }
-        ctx.stroke(p, with: .color(Color.primary), style: wire)
-        for dx: CGFloat in [-px, px] {
-            ctx.fill(Path(ellipseIn: CGRect(x: cx + dx - dr, y: cy - dr, width: dr * 2, height: dr * 2)),
-                     with: .color(Color.primary))
-        }
-    }
-
-    private static func drawGround(_ ctx: GraphicsContext, _ cx: CGFloat, _ cy: CGFloat) {
-        var p = Path()
-        p.move(to: CGPoint(x: cx, y: cy - 16)); p.addLine(to: CGPoint(x: cx, y: cy))
-        zip([22, 14, 7] as [CGFloat], [0, 6, 12] as [CGFloat]).forEach { (w, dy) in
-            p.move(to: CGPoint(x: cx - w/2, y: cy + dy))
-            p.addLine(to: CGPoint(x: cx + w/2, y: cy + dy))
-        }
-        ctx.stroke(p, with: .color(Color.primary), style: StrokeStyle(lineWidth: 1.8, lineCap: .square))
-    }
-
-    private static func drawMeter(_ ctx: GraphicsContext, _ cx: CGFloat, _ cy: CGFloat,
-                                  _ tw: CGFloat, label: String) {
-        let r: CGFloat = 14
-        var p = Path()
-        p.move(to: CGPoint(x: cx - tw, y: cy)); p.addLine(to: CGPoint(x: cx - r, y: cy))
-        p.move(to: CGPoint(x: cx + r,  y: cy)); p.addLine(to: CGPoint(x: cx + tw, y: cy))
-        p.addEllipse(in: CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2))
-        ctx.stroke(p, with: .color(Color.primary), style: wire)
-        ctx.draw(Text(label).font(.system(size: 11, weight: .bold)).foregroundStyle(Color.primary),
-                 at: CGPoint(x: cx, y: cy))
     }
 }
 #endif

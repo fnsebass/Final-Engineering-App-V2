@@ -23,19 +23,35 @@ import SceneKit
 struct EquationGraphView: View {
     let equationText: String      // raw OCR text (shown as subtitle)
     let expression: String        // initial expression from OCR (seed value)
-    @Binding var isPresented: Bool
 
-    // Floating-card callbacks (nil = card is embedded/pinned, not floating)
-    let onHeaderDrag:    ((CGSize) -> Void)?
-    let onTopLeftResize: ((CGSize) -> Void)?
-    let onPin:           (() -> Void)?
+    // Floating-card callbacks (nil = card is embedded, not floating).
+    // onHeaderDrag shifts the card's center by a CGSize delta — used both
+    // for dragging the grab bar AND for keeping the opposite edge visually
+    // anchored while resizing (see the edge-drag gestures below).
+    let onHeaderDrag: ((CGSize) -> Void)?
+    // (widthDelta, centerXDelta) — see the comment on leftEdgeDrag/rightEdgeDrag
+    // for why these two can't be derived from one another.
+    let onWidthDelta: ((CGFloat, CGFloat) -> Void)?
 
     @State private var editExpr: String
 
     // 2-D state
     @State private var xMin: Double = -10
     @State private var xMax: Double = 10
-    @State private var graphHeight: CGFloat = 300
+    @State private var graphHeight: CGFloat = 220
+
+    // Cached plot samples — recomputed only when the expression or x-range
+    // actually changes (see recomputePlotData()), NOT as a plain computed
+    // property. plotData used to be `private var plotData: [DataPoint] { ... }`,
+    // re-sampling the expression 300 times on every single body evaluation —
+    // including every tiny drag-position update while moving this card —
+    // which was the actual cause of the card visibly lagging behind the
+    // finger while dragging.
+    @State private var plotData: [DataPoint] = []
+
+    // Calculator keypad — collapsed by default; revealed by tapping the
+    // button below the expression row.
+    @State private var showCalculatorKeypad = false
 
     // 3-D state — domain ±range in both x and y
     @State private var axisRange: Double = 5
@@ -47,21 +63,23 @@ struct EquationGraphView: View {
     private enum GraphDimension: Equatable { case auto, force2D, force3D }
     @State private var modeOverride: GraphDimension
 
-    // Drag delta tracking (DragGesture gives cumulative translation; we send incremental deltas)
-    @State private var prevHeaderDrag: CGSize = .zero
-    @State private var prevResizeDrag: CGSize = .zero
+    // Hold-to-resize mode — entered/exited by long-pressing the grab bar.
+    @State private var isResizeMode = false
 
-    init(equationText: String, expression: String, forceIs3D: Bool? = nil, isPresented: Binding<Bool>,
-         onHeaderDrag:    ((CGSize) -> Void)? = nil,
-         onTopLeftResize: ((CGSize) -> Void)? = nil,
-         onPin:           (() -> Void)? = nil) {
+    // Drag delta tracking (DragGesture gives cumulative translation; we send incremental deltas)
+    @State private var prevLeftDrag:   CGFloat = 0
+    @State private var prevRightDrag:  CGFloat = 0
+    @State private var prevTopDrag:    CGFloat = 0
+    @State private var prevBottomDrag: CGFloat = 0
+
+    init(equationText: String, expression: String, forceIs3D: Bool? = nil,
+         onHeaderDrag: ((CGSize) -> Void)? = nil,
+         onWidthDelta: ((CGFloat, CGFloat) -> Void)? = nil) {
         self.equationText    = equationText
         self.expression      = expression
-        self._isPresented    = isPresented
         self._editExpr       = State(initialValue: expression)
         self.onHeaderDrag    = onHeaderDrag
-        self.onTopLeftResize = onTopLeftResize
-        self.onPin           = onPin
+        self.onWidthDelta    = onWidthDelta
         switch forceIs3D {
         case .some(true):  self._modeOverride = State(initialValue: .force3D)
         case .some(false): self._modeOverride = State(initialValue: .force2D)
@@ -77,21 +95,61 @@ struct EquationGraphView: View {
         }
     }
 
+    // A bare Shape with no explicit frame reports a very large/flexible
+    // ideal size, which blows up the surrounding ZStack to fill all
+    // available space instead of matching cardContent's actual footprint
+    // (that's why the dashed outline/handles used to render detached,
+    // spanning far more than the card). Measuring cardContent explicitly
+    // and pinning the outline/handles to that exact size fixes it.
+    @State private var cardSize: CGSize = .zero
+
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            expressionRow
-            FunctionKeyboardStrip { key in
-                editExpr += key
+        ZStack {
+            // Outline of the card's normal (unscaled) bounds — only visible
+            // while hold-to-resize mode is active. scaleEffect below is a
+            // purely visual transform that doesn't shrink cardContent's
+            // measured size, so this outline and the edge handles stay
+            // pinned to its un-shrunk bounds even while it visually shrinks.
+            if isResizeMode {
+                RoundedRectangle(cornerRadius: 20)
+                    .strokeBorder(Color.accentColor.opacity(0.5),
+                                  style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
+                    .frame(width: cardSize.width, height: cardSize.height)
             }
-            EquationKeypad { key in editExpr += key }
+
+            cardContent
+                .scaleEffect(isResizeMode ? 0.94 : 1)
+                .onGeometryChange(for: CGSize.self) { $0.size } action: { cardSize = $0 }
+
+            if isResizeMode {
+                resizeHandles
+                    .frame(width: cardSize.width, height: cardSize.height)
+            }
+        }
+        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isResizeMode)
+        .onAppear { recomputePlotData() }
+        .onChange(of: xMin) { _, _ in recomputePlotData() }
+        .onChange(of: xMax) { _, _ in recomputePlotData() }
+        .onChange(of: editExpr) { _, _ in recomputePlotData() }
+    }
+
+    private var cardContent: some View {
+        VStack(spacing: 0) {
+            grabBar
+            expressionRow
+            calculatorToggleRow
+            if showCalculatorKeypad {
+                FunctionKeyboardStrip { key in
+                    editExpr += key
+                }
+                EquationKeypad { key in editExpr += key }
+            }
             Divider()
             if editExpr.trimmingCharacters(in: .whitespaces).isEmpty {
                 emptyPrompt
             } else if is3D {
                 Graph3DScene(expression: editExpr, range: axisRange)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .frame(minHeight: 260)
+                    .frame(height: graphHeight)
                 Divider()
                 controls3D
                 hint3D
@@ -105,106 +163,113 @@ struct EquationGraphView: View {
         .clipShape(RoundedRectangle(cornerRadius: 20))
         .overlay(RoundedRectangle(cornerRadius: 20).strokeBorder(.blue.opacity(0.35), lineWidth: 1))
         .shadow(radius: 18, y: 6)
-        .overlay(alignment: .topLeading) {
-            if onTopLeftResize != nil { resizeHandle }
+    }
+
+    // MARK: - Resize handles (hold-to-resize mode)
+
+    /// Four independent edge handles — drag the left/right handle to change
+    /// width only, top/bottom to change height only, each keeping the
+    /// OPPOSITE edge visually anchored (like dragging a window's edge on
+    /// the Mac). Positioned via GeometryReader against cardContent's
+    /// unscaled bounds (see the comment in `body`).
+    private var resizeHandles: some View {
+        GeometryReader { geo in
+            resizeHandleIcon("arrow.left.and.right")
+                .position(x: 0, y: geo.size.height / 2)
+                .gesture(leftEdgeDrag)
+            resizeHandleIcon("arrow.left.and.right")
+                .position(x: geo.size.width, y: geo.size.height / 2)
+                .gesture(rightEdgeDrag)
+            resizeHandleIcon("arrow.up.and.down")
+                .position(x: geo.size.width / 2, y: 0)
+                .gesture(topEdgeDrag)
+            resizeHandleIcon("arrow.up.and.down")
+                .position(x: geo.size.width / 2, y: geo.size.height)
+                .gesture(bottomEdgeDrag)
         }
     }
 
-    // MARK: - Resize handle (Apple-style L-shaped corner lines)
-
-    private var resizeHandle: some View {
-        ZStack(alignment: .topLeading) {
-            // Transparent hit area
-            Color.clear
-                .frame(width: 36, height: 36)
-                .contentShape(Rectangle())
-                .gesture(
-                    DragGesture()
-                        .onChanged { v in
-                            let delta = CGSize(
-                                width:  v.translation.width  - prevResizeDrag.width,
-                                height: v.translation.height - prevResizeDrag.height
-                            )
-                            prevResizeDrag = v.translation
-                            onTopLeftResize?(delta)
-                        }
-                        .onEnded { _ in prevResizeDrag = .zero }
-                )
-
-            // Visual: two L-shaped lines inset from the corner
-            Canvas { ctx, _ in
-                let len: CGFloat = 12, t: CGFloat = 2, inset: CGFloat = 8
-                for offset in stride(from: CGFloat(0), through: 4, by: 4) {
-                    let x = inset + offset, y = inset + offset
-                    var h = Path()
-                    h.move(to: CGPoint(x: x, y: y + len))
-                    h.addLine(to: CGPoint(x: x, y: y))
-                    h.addLine(to: CGPoint(x: x + len, y: y))
-                    ctx.stroke(h, with: .color(.secondary.opacity(0.6 - offset * 0.1)),
-                               style: StrokeStyle(lineWidth: t, lineCap: .round, lineJoin: .round))
-                }
-            }
-            .frame(width: 36, height: 36)
-            .allowsHitTesting(false)
-        }
+    private func resizeHandleIcon(_ systemName: String) -> some View {
+        Image(systemName: systemName)
+            .font(.system(size: 11, weight: .bold))
+            .foregroundStyle(.white)
+            .frame(width: 26, height: 26)
+            .background(Color.accentColor, in: Circle())
+            .shadow(radius: 3)
+            .contentShape(Circle().inset(by: -8))   // easier to grab than the visible dot
     }
 
-    // MARK: - Header
+    // Width resize's opposite-edge anchoring is handled entirely by the
+    // parent's onWidthDelta closure. The center-x shift needed to keep the
+    // opposite edge fixed is ALWAYS +rawDelta/2 regardless of which edge is
+    // being dragged, but the width change flips sign (-rawDelta for the
+    // left edge, +rawDelta for the right) — those two values are NOT a
+    // fixed ratio of each other, so both must be passed explicitly rather
+    // than having the parent derive one from the other.
+    private var leftEdgeDrag: some Gesture {
+        DragGesture()
+            .onChanged { v in
+                let delta = v.translation.width - prevLeftDrag
+                prevLeftDrag = v.translation.width
+                onWidthDelta?(-delta, delta / 2)
+            }
+            .onEnded { _ in prevLeftDrag = 0 }
+    }
 
-    private var header: some View {
-        HStack(spacing: 10) {
-            Image(systemName: is3D ? "cube" : "waveform.path.ecg")
-                .foregroundStyle(.blue)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(is3D ? "3-D Graph" : "2-D Graph")
-                    .font(.subheadline.weight(.semibold))
-                Text(equationText.isEmpty ? "Edit the expression below" : equationText)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+    private var rightEdgeDrag: some Gesture {
+        DragGesture()
+            .onChanged { v in
+                let delta = v.translation.width - prevRightDrag
+                prevRightDrag = v.translation.width
+                onWidthDelta?(delta, delta / 2)
             }
-            Spacer()
-            Picker("", selection: $modeOverride) {
-                Text("2-D").tag(GraphDimension.force2D)
-                Text("3-D").tag(GraphDimension.force3D)
-                Text("Auto").tag(GraphDimension.auto)
+            .onEnded { _ in prevRightDrag = 0 }
+    }
+
+    private var topEdgeDrag: some Gesture {
+        DragGesture()
+            .onChanged { v in
+                let delta = v.translation.height - prevTopDrag
+                prevTopDrag = v.translation.height
+                graphHeight = min(700, max(160, graphHeight - delta))
+                onHeaderDrag?(CGSize(width: 0, height: delta / 2))
             }
-            .pickerStyle(.segmented)
-            .frame(width: 120)
-            // Pin button — only shown for floating cards
-            if onPin != nil {
-                Button { onPin?() } label: {
-                    Image(systemName: "pin.fill")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
+            .onEnded { _ in prevTopDrag = 0 }
+    }
+
+    private var bottomEdgeDrag: some Gesture {
+        DragGesture()
+            .onChanged { v in
+                let delta = v.translation.height - prevBottomDrag
+                prevBottomDrag = v.translation.height
+                graphHeight = min(700, max(160, graphHeight + delta))
+                onHeaderDrag?(CGSize(width: 0, height: delta / 2))
             }
-            Button {
-                withAnimation(.spring(response: 0.3)) { isPresented = false }
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        // Drag gesture for moving the floating card (no-op when embedded without callback)
-        .gesture(
-            DragGesture()
-                .onChanged { v in
-                    guard onHeaderDrag != nil else { return }
-                    let delta = CGSize(
-                        width:  v.translation.width  - prevHeaderDrag.width,
-                        height: v.translation.height - prevHeaderDrag.height
+            .onEnded { _ in prevBottomDrag = 0 }
+    }
+
+    // MARK: - Grab bar
+
+    /// Replaces the old title header entirely. A single centered capsule,
+    /// about a quarter of the card's width, is the only way to move (plain
+    /// drag) or resize (long-press to toggle hold-to-resize mode, see
+    /// `isResizeMode`) the card.
+    private var grabBar: some View {
+        GeometryReader { geo in
+            ZStack {
+                if onHeaderDrag != nil {
+                    DragHandleRepresentable(
+                        onPanDelta: { delta in onHeaderDrag?(delta) },
+                        onLongPress: { withAnimation(.spring(response: 0.3)) { isResizeMode.toggle() } }
                     )
-                    prevHeaderDrag = v.translation
-                    onHeaderDrag?(delta)
                 }
-                .onEnded { _ in prevHeaderDrag = .zero }
-        )
+                Capsule()
+                    .fill(Color.secondary.opacity(0.4))
+                    .frame(width: geo.size.width * 0.25, height: 5)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(height: 22)
     }
 
     // MARK: - Expression editor row
@@ -245,6 +310,30 @@ struct EquationGraphView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
+    }
+
+    // MARK: - Calculator keypad toggle
+
+    /// The function-key strip + numeric keypad are hidden by default (they
+    /// used to always take up a big chunk of the card's height); tapping
+    /// this reveals them right below the expression row.
+    private var calculatorToggleRow: some View {
+        HStack {
+            Spacer()
+            Button {
+                withAnimation(.spring(response: 0.3)) { showCalculatorKeypad.toggle() }
+            } label: {
+                Image(systemName: "sum")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(showCalculatorKeypad ? Color.accentColor : Color.secondary)
+                    .frame(width: 26, height: 22)
+                    .background(showCalculatorKeypad ? Color.accentColor.opacity(0.15) : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 6))
+            }
+            .buttonStyle(.plain)
+            Spacer()
+        }
+        .padding(.vertical, 2)
         .background(Color(.systemGray6))
     }
 
@@ -332,8 +421,8 @@ struct EquationGraphView: View {
         let segmentID: Int
     }
 
-    private var plotData: [DataPoint] {
-        guard xMax > xMin, !editExpr.isEmpty else { return [] }
+    private func recomputePlotData() {
+        guard xMax > xMin, !editExpr.isEmpty else { plotData = []; return }
         let n = 300
         let dx = (xMax - xMin) / Double(n)
         var pts: [DataPoint] = []
@@ -347,7 +436,7 @@ struct EquationGraphView: View {
             prevY = yv
             pts.append(DataPoint(x: xv, y: yv, segmentID: seg))
         }
-        return pts
+        plotData = pts
     }
 
     private var yDomain: ClosedRange<Double> {
@@ -394,6 +483,59 @@ struct EquationGraphView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
+    }
+}
+
+/// Native UIKit pan + long-press recognizer used on the grab bar — mirrors
+/// `PhotoGrabZoneRepresentable`'s approach of hosting multiple UIKit
+/// recognizers side by side (with a delegate allowing simultaneous
+/// recognition), reporting true incremental pan deltas (translation reset
+/// to zero every tick) straight from UIKit's touch handling rather than
+/// through SwiftUI's `DragGesture`. Long-press toggles hold-to-resize mode.
+private struct DragHandleRepresentable: UIViewRepresentable {
+    let onPanDelta: (CGSize) -> Void
+    let onLongPress: () -> Void
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .clear
+        let pan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePan(_:)))
+        let longPress = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleLongPress(_:)))
+        longPress.minimumPressDuration = 0.35
+        pan.delegate = context.coordinator
+        longPress.delegate = context.coordinator
+        view.addGestureRecognizer(pan)
+        view.addGestureRecognizer(longPress)
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        context.coordinator.onPanDelta = onPanDelta
+        context.coordinator.onLongPress = onLongPress
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var onPanDelta: ((CGSize) -> Void)?
+        var onLongPress: (() -> Void)?
+
+        @objc func handlePan(_ gr: UIPanGestureRecognizer) {
+            guard gr.state == .changed else { return }
+            let translation = gr.translation(in: gr.view)
+            onPanDelta?(CGSize(width: translation.x, height: translation.y))
+            gr.setTranslation(.zero, in: gr.view)
+        }
+
+        @objc func handleLongPress(_ gr: UILongPressGestureRecognizer) {
+            guard gr.state == .began else { return }
+            onLongPress?()
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                                shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            true
+        }
     }
 }
 

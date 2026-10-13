@@ -12,17 +12,22 @@ import SwiftData
 
 @Model
 final class Chapter {
-    var name: String
-    var createdDate: Date
+    var name: String = "Chapter 1"
+    var createdDate: Date = Date()
 
     /// Manual ordering within the book, mirrors Page.pageIndex.
-    var orderIndex: Int
+    var orderIndex: Int = 0
+
+    /// Timestamp of the last time this chapter was expanded or had one of
+    /// its notes opened. Drives which chapter auto-expands the next time
+    /// its book's sidebar is shown — see ChapterSidebarView.
+    var lastAccessedDate: Date?
 
     /// The book (folder) this chapter belongs to.
     var folder: Folder?
 
     @Relationship(deleteRule: .nullify, inverse: \Notepad.chapter)
-    var notes: [Notepad]
+    var notes: [Notepad] = []
 
     init(name: String = "Chapter 1", createdDate: Date = .now, orderIndex: Int = 0) {
         self.name = name

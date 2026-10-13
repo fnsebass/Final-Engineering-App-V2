@@ -13,14 +13,14 @@ import Foundation
 @Model
 final class HandwritingCorrection {
     /// What OCR produced (e.g. "1og", "B", "u").
-    var ocrFragment: String
+    var ocrFragment: String = ""
     /// What the user confirmed it to be (e.g. "log", "8", "v").
-    var correctedFragment: String
+    var correctedFragment: String = ""
     /// A short snippet of the surrounding equation shown in the memory panel.
-    var exampleContext: String
-    var dateAdded: Date
+    var exampleContext: String = ""
+    var dateAdded: Date = Date()
     /// Incremented each time this correction is applied automatically.
-    var useCount: Int
+    var useCount: Int = 0
 
     init(ocrFragment: String, correctedFragment: String, exampleContext: String = "") {
         self.ocrFragment = ocrFragment

@@ -82,9 +82,9 @@ struct FBDRamp: Codable, Identifiable {
 
 @Model
 final class FBDDiagram {
-    var title: String
-    var createdDate: Date
-    var forcesJSON: String
+    var title: String = "New FBD"
+    var createdDate: Date = Date()
+    var forcesJSON: String = "[]"
     // Optional so SwiftData can add these columns via lightweight migration on existing stores.
     var rampsJSON:  String?
     var objectX: Double?

@@ -15,6 +15,7 @@ enum LayoutPrefs {
     static let accentRaw = "layout.accent"
     static let defaultPaperStyle = "layout.defaultPaperStyle"
     static let defaultPaperColorHex = "layout.defaultPaperColorHex"
+    static let defaultGridColumns = "layout.defaultGridColumns"
     static let aiVerbose = "ai.verbose"
 }
 

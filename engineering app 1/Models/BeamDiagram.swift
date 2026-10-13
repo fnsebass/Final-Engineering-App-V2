@@ -45,11 +45,11 @@ struct BeamLoad: Codable, Identifiable {
 
 @Model
 final class BeamDiagram {
-    var title: String
-    var createdDate: Date
-    var beamLength: Double
-    var supportsJSON: String
-    var loadsJSON: String
+    var title: String = "New Beam"
+    var createdDate: Date = Date()
+    var beamLength: Double = 8.0
+    var supportsJSON: String = "[]"
+    var loadsJSON: String = "[]"
 
     init(title: String = "New Beam", length: Double = 8.0) {
         self.title       = title

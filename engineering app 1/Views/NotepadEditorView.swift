@@ -61,6 +61,7 @@ struct NotepadEditorView: View {
     #if os(iOS)
     @State private var activeTool: DrawingTool = .pen
     @State private var penColor: Color = Color(red: 0.15, green: 0.15, blue: 0.15)
+    @State private var penWidth: Double = 3
     @State private var rulerActive: Bool = false
 
     // Pencil slot selection — persisted globally so it's the same across all notepads.
@@ -94,6 +95,11 @@ struct NotepadEditorView: View {
     @AppStorage(GeneralPrefs.defaultExportFormat) private var exportFormatRaw = ExportFormat.pdf.rawValue
     @State private var exportedFileURL: URL? = nil
     @State private var showExportShare = false
+    @State private var isExporting = false
+
+    // AI Practice grading (Submit button — only shown when notepad.isAIPractice)
+    @State private var isGradingPractice = false
+    @State private var showGradingResults = false
     #endif
 
     var body: some View {
@@ -112,6 +118,9 @@ struct NotepadEditorView: View {
                 if let url = exportedFileURL {
                     ActivityView(activityItems: [url])
                 }
+            }
+            .sheet(isPresented: $showGradingResults) {
+                AIPracticeGradingResultsView(notepad: notepad)
             }
             #endif
     }
@@ -161,6 +170,7 @@ struct NotepadEditorView: View {
             notepad: notepad,
             activeTool: $activeTool,
             penColor: $penColor,
+            penWidth: $penWidth,
             rulerActive: $rulerActive,
             isVerifyMode: $isVerifyMode,
             showPhotoPicker: $showPhotoPicker,
@@ -183,7 +193,11 @@ struct NotepadEditorView: View {
     #if os(iOS)
     private var headerBar: some View {
         VStack(spacing: 0) {
-            modeTabRow
+            if notepad.isAIPractice {
+                aiPracticeModeRow
+            } else {
+                modeTabRow
+            }
             Divider()
             toolRow
             Divider()
@@ -200,6 +214,17 @@ struct NotepadEditorView: View {
             modeTab("Draw",    icon: "pencil.tip",     style: .blank)
         }
         .frame(height: 32)
+    }
+
+    /// Replaces modeTabRow for AI Practice notepads — switching to Math/
+    /// English/Draw would overwrite the worksheet's typed question layout,
+    /// so there's no path back to any of those paper styles from here.
+    private var aiPracticeModeRow: some View {
+        Label("AI Practice", systemImage: "wand.and.stars")
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity)
+            .frame(height: 32)
     }
 
     private func modeTab(_ label: String, icon: String, style: PaperStyle) -> some View {
@@ -256,6 +281,12 @@ struct NotepadEditorView: View {
     // ── Pencil tips · drawing tools · shape · photo · ruler · calculator · verify · export · settings ──
     private var trailingCluster: some View {
         HStack(spacing: 0) {
+            // ── Pencil thickness (plain Pen tool only) ──────────
+            if activeTool == .pen {
+                penWidthSlider
+                rowDivider
+            }
+
             // ── Pencil tips (tap = select, double-tap = recolor) ──
             HStack(spacing: 3) {
                 ForEach(0..<5, id: \.self) { i in
@@ -303,6 +334,9 @@ struct NotepadEditorView: View {
             // ── Shape tool ────────────────────────────────────
             shapeBtn
 
+            // ── Smart Draw (freehand → snapped line/arrow/shape) ─
+            toolBtn(icon: "wand.and.rays", tool: .smartDraw)
+
             // ── Photo import ──────────────────────────────────
             Button { showPhotoPicker = true } label: {
                 Image(systemName: "photo.badge.plus")
@@ -349,12 +383,39 @@ struct NotepadEditorView: View {
 
             // ── Export ────────────────────────────────────────
             Button { exportNotepad() } label: {
-                Image(systemName: "square.and.arrow.up")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(Color.secondary)
-                    .frame(width: 32, height: 32)
+                Group {
+                    if isExporting {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(Color.secondary)
+                    }
+                }
+                .frame(width: 32, height: 32)
             }
             .buttonStyle(.plain)
+            .disabled(isExporting)
+
+            // ── Submit for grading (AI Practice notepads only) ──
+            if notepad.isAIPractice {
+                rowDivider
+
+                Button { Task { await submitPractice() } } label: {
+                    if isGradingPractice {
+                        ProgressView()
+                            .frame(width: 32, height: 32)
+                    } else {
+                        Image(systemName: "checkmark.seal")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(Color.green)
+                            .frame(width: 32, height: 32)
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(isGradingPractice)
+            }
 
             rowDivider
 
@@ -435,20 +496,87 @@ struct NotepadEditorView: View {
         isEditingTitle = false
     }
 
-    // MARK: Export (Settings → General → Default Export Format)
+    // MARK: AI Practice grading (Submit button)
 
-    private func exportNotepad() {
+    /// Crops just the student's answer ink for each question directly out of
+    /// the page's stored PKDrawing (independent of scroll position — see
+    /// AIPracticeQuestion), grades each crop on-device (FoundationModels
+    /// multimodal prompting — no network call, no rate limit) along with its
+    /// question text, and records the verdict/feedback before showing results.
+    private func submitPractice() async {
         guard let page = notepad.orderedPages.first else { return }
+        isGradingPractice = true
+        defer { isGradingPractice = false }
+
         let drawing = page.drawingData.isEmpty
             ? PKDrawing()
             : (try? PKDrawing(data: page.drawingData)) ?? PKDrawing()
+
+        for question in notepad.orderedAIPracticeQuestions {
+            let rect = CGRect(
+                x: 0, y: question.answerYStart,
+                width: AIPracticeGenerator.contentWidth,
+                height: question.answerYEnd - question.answerYStart
+            )
+            let image = drawing.image(from: rect, scale: 2)
+            guard let cgImage = image.cgImage else { continue }
+
+            guard #available(iOS 27.0, *) else {
+                question.isCorrect = nil
+                question.gradeFeedback = "Grading needs iOS 27 or later."
+                continue
+            }
+
+            do {
+                let (isCorrect, feedback) = try await AIPracticeGenerator.grade(image: cgImage, question: question.text)
+                question.isCorrect = isCorrect
+                question.gradeFeedback = feedback
+            } catch {
+                question.isCorrect = nil
+                question.gradeFeedback = error.localizedDescription
+            }
+        }
+
+        showGradingResults = true
+    }
+
+    // MARK: Export (Settings → General → Default Export Format)
+
+    /// Rasterizing the whole drawing and re-encoding it as PDF/PNG used to
+    /// run synchronously on the main thread inside the button tap, so the
+    /// UI froze (no spinner, nothing) until it finished — which from the
+    /// outside looked indistinguishable from the share sheet just being
+    /// slow. Moving the actual rendering off the main thread, and showing
+    /// a spinner on the export button in the meantime, fixes both: the
+    /// share sheet itself was never the bottleneck.
+    private func exportNotepad() {
+        guard let page = notepad.orderedPages.first else { return }
+        let drawingData = page.drawingData
+        let fileName = notepad.title.isEmpty ? "Notepad" : notepad.title
+        let format = ExportFormat(rawValue: exportFormatRaw) ?? .pdf
+
+        isExporting = true
+        Task.detached(priority: .userInitiated) {
+            let url = Self.renderExportFile(drawingData: drawingData, fileName: fileName, format: format)
+            await MainActor.run {
+                isExporting = false
+                if let url {
+                    exportedFileURL = url
+                    showExportShare = true
+                }
+            }
+        }
+    }
+
+    private nonisolated static func renderExportFile(drawingData: Data, fileName: String, format: ExportFormat) -> URL? {
+        let drawing = drawingData.isEmpty
+            ? PKDrawing()
+            : (try? PKDrawing(data: drawingData)) ?? PKDrawing()
 
         let bounds = drawing.bounds.isEmpty
             ? CGRect(x: 0, y: 0, width: 1000, height: 1400)
             : drawing.bounds.insetBy(dx: -20, dy: -20)
         let image = drawing.image(from: bounds, scale: 2)
-        let fileName = notepad.title.isEmpty ? "Notepad" : notepad.title
-        let format = ExportFormat(rawValue: exportFormatRaw) ?? .pdf
 
         do {
             let url: URL
@@ -465,13 +593,13 @@ struct NotepadEditorView: View {
             case .png:
                 url = FileManager.default.temporaryDirectory
                     .appendingPathComponent(fileName).appendingPathExtension("png")
-                guard let data = image.pngData() else { return }
+                guard let data = image.pngData() else { return nil }
                 try data.write(to: url, options: .atomic)
             }
-            exportedFileURL = url
-            showExportShare = true
+            return url
         } catch {
             // Best-effort export; if writing the temp file fails there's nothing to share.
+            return nil
         }
     }
 
@@ -482,6 +610,23 @@ struct NotepadEditorView: View {
             .fill(Color.primary.opacity(0.12))
             .frame(width: 1, height: 24)
             .padding(.horizontal, 4)
+    }
+
+    /// Only shown while the plain Pen tool is active — the other drawing
+    /// tools (marker, highlighter, straight line, shape) have their own
+    /// fixed/derived widths and aren't affected by this.
+    private var penWidthSlider: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "pencil.tip")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+            Slider(value: $penWidth, in: 1...40)
+                .frame(width: 270)
+            Image(systemName: "pencil.tip")
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 6)
     }
 
     private func toolBtn(icon: String, tool: DrawingTool) -> some View {

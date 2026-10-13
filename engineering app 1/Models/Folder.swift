@@ -12,8 +12,8 @@ import SwiftData
 
 @Model
 final class Folder {
-    var name: String
-    var createdDate: Date
+    var name: String = "New Folder"
+    var createdDate: Date = Date()
 
     /// Cover color as a "#RRGGBB" hex string, chosen from BookTheme's muted
     /// palette. Defaults to the palette's first color.
@@ -23,10 +23,10 @@ final class Folder {
     var iconName: String = "book.closed.fill"
 
     @Relationship(deleteRule: .nullify, inverse: \Notepad.folder)
-    var notepads: [Notepad]
+    var notepads: [Notepad] = []
 
     @Relationship(deleteRule: .cascade, inverse: \Chapter.folder)
-    var chapters: [Chapter]
+    var chapters: [Chapter] = []
 
     init(name: String = "New Folder", createdDate: Date = .now) {
         self.name = name

@@ -37,4 +37,8 @@ enum DrawingTool: Equatable {
     case eraser
     case lasso
     case shape
+    /// Draw freehand (a line, arrow, or closed shape) in one continuous
+    /// stroke; pausing briefly or lifting snaps it into a clean geometric
+    /// version — see SmartDrawOverlay / ShapeRecognizer.
+    case smartDraw
 }

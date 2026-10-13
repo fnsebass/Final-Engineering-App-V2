@@ -38,6 +38,22 @@ struct PencilCanvasView: UIViewRepresentable {
     let paperColorHex: String
     let paperStyle: PaperStyle
     let gridColumns: Int
+    /// Only non-empty for `paperStyle == .aiPractice` — see GridContentView.
+    var practiceQuestions: [AIPracticeQuestionLayout] = []
+    /// Content-space bounding boxes of photos placed on this page — grid/
+    /// lined/dot lines are skipped inside these so photos don't look
+    /// washed-out by lines crossing over them.
+    var photoExclusionRects: [CGRect] = []
+    /// Reports the canvas's current vertical scroll (content-space points) so
+    /// CanvasWorkspace can keep its SwiftUI-hosted photo layer in sync —
+    /// mirrors how this scroll offset already keeps grid lines aligned.
+    var onScrollOffsetChange: (CGFloat) -> Void = { _ in }
+    /// True whenever the Apple Pencil is hovering near (or, briefly, just
+    /// touched down on) the canvas — lets CanvasWorkspace proactively
+    /// disable photo drag/pinch/rotate hit-testing before the Pencil ever
+    /// makes contact, so there's no race with detecting a touch's type at
+    /// the exact moment it lands. Finger-only interaction is unaffected.
+    var onPencilProximityChange: (Bool) -> Void = { _ in }
     @Binding var activeTool: DrawingTool
     @Binding var penColor: Color
     let penWidth: Double
@@ -107,7 +123,8 @@ struct PencilCanvasView: UIViewRepresentable {
         // Force light-mode so PKCanvasView never inverts stroke colors.
         wrapper.overrideUserInterfaceStyle = .light
 
-        grid.setup(style: paperStyle, columns: gridColumns, paper: paper)
+        grid.setup(style: paperStyle, columns: gridColumns, paper: paper,
+                   practiceQuestions: practiceQuestions, photoExclusionRects: photoExclusionRects)
 
         canvas.backgroundColor = .clear
         canvas.isOpaque        = false
@@ -125,6 +142,8 @@ struct PencilCanvasView: UIViewRepresentable {
         context.coordinator.canvas             = canvas
         context.coordinator.gridView           = grid
         context.coordinator.straightLineOverlay = wrapper.straightLineOverlay
+        context.coordinator.onScrollOffsetChange = onScrollOffsetChange
+        context.coordinator.onPencilProximityChange = onPencilProximityChange
         context.coordinator.onPencilSqueezeBegan = onPencilSqueezeBegan
         context.coordinator.onPencilSqueezeEnded = onPencilSqueezeEnded
 
@@ -179,6 +198,16 @@ struct PencilCanvasView: UIViewRepresentable {
             coord?.commitShape(from: start, to: end)
         }
 
+        // Wire Smart Draw overlay commit callbacks — a recognized shape
+        // (already snapped) or, failing recognition, the raw freehand points.
+        context.coordinator.smartDrawOverlay = wrapper.smartDrawOverlay
+        wrapper.smartDrawOverlay.onCommitShape = { [weak coord] shape in
+            coord?.commitSmartDraw(shape: shape)
+        }
+        wrapper.smartDrawOverlay.onCommitRawPoints = { [weak coord] points in
+            coord?.commitSmartDraw(rawPoints: points)
+        }
+
         // Apple Pencil interaction (double-tap + Pencil Pro squeeze)
         let pencilInteraction = UIPencilInteraction()
         pencilInteraction.delegate = context.coordinator
@@ -213,10 +242,13 @@ struct PencilCanvasView: UIViewRepresentable {
         coord.onSwitchColor        = onSwitchColor
         coord.onShowToolPalette    = onShowToolPalette
         coord.onNeedsRecreate      = onNeedsRecreate
+        coord.onScrollOffsetChange = onScrollOffsetChange
+        coord.onPencilProximityChange = onPencilProximityChange
         canvas.drawingPolicy       = Self.resolvedDrawingPolicy()
 
         let paper = PaperTheme.uiColor(fromHex: paperColorHex)
-        wrapper.gridView.setup(style: paperStyle, columns: gridColumns, paper: paper)
+        wrapper.gridView.setup(style: paperStyle, columns: gridColumns, paper: paper,
+                                practiceQuestions: practiceQuestions, photoExclusionRects: photoExclusionRects)
 
         // Store current ink properties so the coordinator can commit straight lines and shapes.
         let inkColor = inkUIColor(from: penColor)
@@ -247,11 +279,28 @@ struct PencilCanvasView: UIViewRepresentable {
         } else {
             shapeOvr.deactivate()
         }
+
+        // Activate or deactivate the Smart Draw overlay.
+        let smartOvr = wrapper.smartDrawOverlay
+        smartOvr.inkColor     = inkColor
+        smartOvr.inkWidth     = CGFloat(penWidth)
+        smartOvr.scrollOffset = canvas.contentOffset.y
+        // Only grid/dots paper actually shows a grid to snap to.
+        if paperStyle == .grid || paperStyle == .dots {
+            smartOvr.gridSpacing = canvas.bounds.width / CGFloat(max(gridColumns, 2))
+        } else {
+            smartOvr.gridSpacing = nil
+        }
+        if activeTool == .smartDraw {
+            smartOvr.activate()
+        } else {
+            smartOvr.deactivate()
+        }
     }
 
     private func applyTool(to canvas: CanvasView, tool: DrawingTool, color: UIColor, width: CGFloat) {
         switch tool {
-        case .pen, .straightLine, .shape:
+        case .pen, .straightLine, .shape, .smartDraw:
                                   canvas.tool = PKInkingTool(.pen,         color: color, width: width)
         case .marker:             canvas.tool = PKInkingTool(.marker,      color: color, width: width * 4)
         case .highlighter:        canvas.tool = PKInkingTool(.marker, color: color.withAlphaComponent(0.42), width: width * 8)
@@ -270,6 +319,7 @@ struct PencilCanvasView: UIViewRepresentable {
         weak var straightLineOverlay: StraightLineOverlay?
 
         weak var shapeOverlay: ShapeOverlay?
+        weak var smartDrawOverlay: SmartDrawOverlay?
 
         var activeTool: DrawingTool = .pen
         var isDrawing  = false
@@ -294,6 +344,8 @@ struct PencilCanvasView: UIViewRepresentable {
         var onRequestTool: (DrawingTool) -> Void = { _ in }
         var onSwitchColor: () -> Void = {}
         var onShowToolPalette: (CGPoint) -> Void = { _ in }
+        var onScrollOffsetChange: (CGFloat) -> Void = { _ in }
+        var onPencilProximityChange: (Bool) -> Void = { _ in }
         var onNeedsRecreate: () -> Void = {}
 
         /// Updated live while the Pencil hovers above the canvas (supported
@@ -353,7 +405,11 @@ struct PencilCanvasView: UIViewRepresentable {
             return CGPoint(x: p.x, y: p.y - canvas.contentOffset.y)
         }
 
-        // MARK: Pencil hover tracking (for palette positioning)
+        // MARK: Pencil hover tracking (for palette positioning + proximity)
+
+        /// Cancels a pending "pencil moved away" signal so a hover blip
+        /// between strokes doesn't briefly re-enable photo dragging.
+        private var proximityResetTask: DispatchWorkItem?
 
         @objc func handleHover(_ gesture: UIHoverGestureRecognizer) {
             guard let canvas = canvas else { return }
@@ -361,6 +417,21 @@ struct PencilCanvasView: UIViewRepresentable {
             case .began, .changed:
                 let p = gesture.location(in: canvas)
                 lastHoverViewPosition = CGPoint(x: p.x, y: p.y - canvas.contentOffset.y)
+                proximityResetTask?.cancel()
+                onPencilProximityChange(true)
+                smartDrawOverlay?.isPencilNearby = true
+            case .ended, .cancelled:
+                // Hovering stops right as the Pencil makes contact, which is
+                // exactly the moment a new touch's hit-testing is decided —
+                // so "pencil nearby" needs to outlive the hover signal itself
+                // by a beat to reliably cover that handoff. Debounced rather
+                // than cleared immediately.
+                let task = DispatchWorkItem { [weak self] in
+                    self?.onPencilProximityChange(false)
+                    self?.smartDrawOverlay?.isPencilNearby = false
+                }
+                proximityResetTask = task
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: task)
             default:
                 break // Pencil moved out of hover range — keep the last known spot.
             }
@@ -461,6 +532,29 @@ struct PencilCanvasView: UIViewRepresentable {
             canvas.drawing = drawing
         }
 
+        // MARK: Smart Draw commit
+
+        /// A shape ShapeRecognizer classified (and SmartDrawOverlay already
+        /// axis/grid-snapped) — turned into ink via ShapeStrokeBuilder.
+        func commitSmartDraw(shape: RecognizedShape) {
+            guard let canvas = canvas else { return }
+            let strokes = ShapeStrokeBuilder.strokes(for: shape, inkColor: currentInkColor, inkWidth: currentPenWidth)
+            guard !strokes.isEmpty else { return }
+            var drawing = canvas.drawing
+            drawing.strokes.append(contentsOf: strokes)
+            canvas.drawing = drawing
+        }
+
+        /// Nothing was confidently recognized — commit the freehand points
+        /// as an ordinary stroke so the stroke is never silently dropped.
+        func commitSmartDraw(rawPoints points: [CGPoint]) {
+            guard let canvas = canvas, points.count >= 2 else { return }
+            let stroke = ShapeStrokeBuilder.strokeAlong(points: points, color: currentInkColor, width: currentPenWidth)
+            var drawing = canvas.drawing
+            drawing.strokes.append(stroke)
+            canvas.drawing = drawing
+        }
+
         private func shapeStrokes(from start: CGPoint, to end: CGPoint, kind: ShapeKind) -> [PKStroke] {
             let rect = CGRect(
                 x: Swift.min(start.x, end.x),
@@ -549,6 +643,7 @@ struct PencilCanvasView: UIViewRepresentable {
             gridView?.setNeedsDisplay()
             straightLineOverlay?.scrollOffset = scrollView.contentOffset.y
             shapeOverlay?.scrollOffset = scrollView.contentOffset.y
+            onScrollOffsetChange(scrollView.contentOffset.y)
 
             guard let canvas = canvas,
                   scrollView.bounds.height > 0,
@@ -702,6 +797,7 @@ final class CanvasWrapper: UIView {
     let gridView: GridContentView
     let straightLineOverlay: StraightLineOverlay
     let shapeOverlay: ShapeOverlay
+    let smartDrawOverlay: SmartDrawOverlay
 
     private var zoomScale: CGFloat = 1.0
     private var zoomTx: CGFloat = 0
@@ -715,11 +811,13 @@ final class CanvasWrapper: UIView {
         gridView            = GridContentView()
         straightLineOverlay = StraightLineOverlay()
         shapeOverlay        = ShapeOverlay()
+        smartDrawOverlay    = SmartDrawOverlay()
         super.init(frame: .zero)
         addSubview(gridView)             // z = 0
         addSubview(canvas)               // z = 1
         addSubview(straightLineOverlay)  // z = 2, intercepts pencil touches when active
         addSubview(shapeOverlay)         // z = 3, intercepts pencil touches for shape drawing
+        addSubview(smartDrawOverlay)     // z = 4, intercepts pencil touches for Smart Draw
 
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch))
         addGestureRecognizer(pinch)
@@ -778,6 +876,7 @@ final class CanvasWrapper: UIView {
         gridView.frame            = bounds
         straightLineOverlay.frame = bounds
         shapeOverlay.frame        = bounds
+        smartDrawOverlay.frame    = bounds
     }
 }
 
@@ -1015,6 +1114,181 @@ final class ShapeOverlay: UIView {
     }
 }
 
+// MARK: - SmartDrawOverlay
+
+/// Transparent view (topmost, above ShapeOverlay) that intercepts pencil
+/// touches when the Smart Draw tool is active. Unlike StraightLineOverlay/
+/// ShapeOverlay (which only need a start/end point), this captures the full
+/// freehand path so ShapeRecognizer can classify it as a line, arrow,
+/// ellipse, or straight-edged polygon. Commits either the recognized shape
+/// (already axis/grid-snapped) once the stylus pauses or lifts, or — if
+/// nothing was confidently recognized — the raw freehand points as an
+/// ordinary stroke, so a stroke is never silently dropped.
+final class SmartDrawOverlay: UIView {
+    var onCommitShape: ((RecognizedShape) -> Void)?
+    var onCommitRawPoints: (([CGPoint]) -> Void)?
+
+    var inkColor: UIColor = .black { didSet { previewLayer.strokeColor = inkColor.cgColor } }
+    var inkWidth: CGFloat = 3     { didSet { previewLayer.lineWidth = inkWidth } }
+    /// PKCanvasView's current contentOffset.y — used to convert view ↔ content coordinates.
+    var scrollOffset: CGFloat = 0
+    /// Grid spacing in content-space points, when the current paper has an
+    /// active grid to snap to; nil disables grid snapping entirely.
+    var gridSpacing: CGFloat? = nil
+
+    private(set) var isCapturing = false
+    /// Content-space points collected for the in-progress stroke.
+    private var points: [CGPoint] = []
+    private let previewLayer = CAShapeLayer()
+    private var dwellTask: DispatchWorkItem?
+    /// True only when the Apple Pencil is confirmed hovering near (or just
+    /// touched down on) the canvas — set by PencilCanvasView.Coordinator
+    /// from its existing hover tracking. This overlay only ever hit-tests
+    /// while this is true, so a finger touch meant for scrolling can never
+    /// be swallowed by an unreliable per-touch type check at the exact
+    /// instant hitTest runs (relying on `event.allTouches` there is racy —
+    /// see PhotoGrabZoneView's hitTest for the same lesson learned).
+    var isPencilNearby = false
+    /// How long the stylus must stay still (no touchesMoved) before the
+    /// in-progress stroke is classified and snapped automatically.
+    private static let dwellDelay: TimeInterval = 0.35
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+        previewLayer.fillColor = UIColor.clear.cgColor
+        previewLayer.lineCap = .round
+        previewLayer.lineJoin = .round
+        layer.addSublayer(previewLayer)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func activate() {
+        previewLayer.strokeColor = inkColor.cgColor
+        previewLayer.lineWidth = inkWidth
+        isCapturing = true
+        isUserInteractionEnabled = true
+    }
+
+    func deactivate() {
+        isCapturing = false
+        isUserInteractionEnabled = false
+        reset()
+    }
+
+    // Only hit-testable while the Pencil is confirmed nearby (see
+    // isPencilNearby) — never based on a per-touch type check here, which
+    // can't reliably tell pencil from finger at the exact moment a new
+    // touch begins and previously caused scrolling to freeze entirely.
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        guard isCapturing, isPencilNearby, bounds.contains(point) else { return nil }
+        return self
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let t = touches.first(where: { $0.type == .pencil }) else { return }
+        points = [toContent(t.location(in: self))]
+        updatePreview()
+        scheduleDwell()
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let t = touches.first(where: { $0.type == .pencil }) else { return }
+        points.append(toContent(t.location(in: self)))
+        updatePreview()
+        scheduleDwell() // still moving — push the dwell-triggered commit back out
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        dwellTask?.cancel()
+        commit()
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        dwellTask?.cancel()
+        reset()
+    }
+
+    private func scheduleDwell() {
+        dwellTask?.cancel()
+        let task = DispatchWorkItem { [weak self] in self?.commit() }
+        dwellTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.dwellDelay, execute: task)
+    }
+
+    private func commit() {
+        guard isCapturing, points.count >= 2 else { reset(); return }
+        let captured = points
+        reset() // clear immediately so a continued touch starts a fresh stroke
+
+        if let shape = ShapeRecognizer.recognize(captured) {
+            onCommitShape?(snapped(shape))
+        } else {
+            onCommitRawPoints?(captured)
+        }
+    }
+
+    // MARK: Axis + grid snapping
+
+    private func snapped(_ shape: RecognizedShape) -> RecognizedShape {
+        switch shape {
+        case let .line(a, b):
+            let (na, nb) = axisSnappedSegment(a, b)
+            return .line(gridSnap(na), gridSnap(nb))
+        case let .arrow(start, tip):
+            let (ns, nt) = axisSnappedSegment(start, tip)
+            return .arrow(gridSnap(ns), gridSnap(nt))
+        case let .ellipse(center, rx, ry):
+            return .ellipse(center: gridSnap(center), radiusX: rx, radiusY: ry)
+        case let .polygon(vertices):
+            return .polygon(vertices.map(gridSnap))
+        }
+    }
+
+    private func axisSnappedSegment(_ a: CGPoint, _ b: CGPoint) -> (CGPoint, CGPoint) {
+        let dx = b.x - a.x, dy = b.y - a.y
+        let len = hypot(dx, dy)
+        guard len > 0, let snappedAngle = ShapeRecognizer.snappedAxisAngle(atan2(dy, dx)) else { return (a, b) }
+        let newB = CGPoint(x: a.x + len * cos(snappedAngle), y: a.y + len * sin(snappedAngle))
+        return (a, newB)
+    }
+
+    private func gridSnap(_ p: CGPoint) -> CGPoint {
+        guard let spacing = gridSpacing else { return p }
+        return ShapeRecognizer.snappedToGrid(p, spacing: spacing, radius: spacing * 0.3)
+    }
+
+    // MARK: Preview + geometry helpers
+
+    private func updatePreview() {
+        let viewPoints = points.map { CGPoint(x: $0.x, y: $0.y - scrollOffset) }
+        let path = CGMutablePath()
+        if let first = viewPoints.first {
+            path.move(to: first)
+            for p in viewPoints.dropFirst() { path.addLine(to: p) }
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        previewLayer.path = path
+        CATransaction.commit()
+    }
+
+    private func reset() {
+        points = []
+        dwellTask?.cancel()
+        dwellTask = nil
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        previewLayer.path = nil
+        CATransaction.commit()
+    }
+
+    private func toContent(_ vp: CGPoint) -> CGPoint {
+        CGPoint(x: vp.x, y: vp.y + scrollOffset)
+    }
+}
+
 // MARK: - CanvasView (PKCanvasView subclass)
 
 final class CanvasView: PKCanvasView {
@@ -1047,6 +1321,11 @@ final class GridContentView: UIView {
     private(set) var currentStyle: PaperStyle = .blank
     private(set) var currentColumns: Int = 16
     private var lineColor: UIColor = UIColor(red: 0.0, green: 0.47, blue: 0.84, alpha: 0.4)
+    private var isDarkPaper = false
+    private var practiceQuestions: [AIPracticeQuestionLayout] = []
+    /// Content-space photo bounding boxes — grid/lined/dot lines are clipped
+    /// out of these so photos don't look washed-out by lines crossing them.
+    private var photoExclusionRects: [CGRect] = []
 
     // Settings → Paper & Layout → Margins / Page Size, re-read on every
     // setup() call (which SwiftUI drives via updateUIView often enough to
@@ -1056,13 +1335,22 @@ final class GridContentView: UIView {
 
     var scrollOffset: CGFloat = 0
 
-    func setup(style: PaperStyle, columns: Int, paper: UIColor) {
+    func setup(style: PaperStyle, columns: Int, paper: UIColor,
+               practiceQuestions: [AIPracticeQuestionLayout] = [], photoExclusionRects: [CGRect] = []) {
         currentStyle   = style
         currentColumns = max(columns, 2)
+        self.practiceQuestions = practiceQuestions
+        // Pre-merge overlapping rects: the even-odd "punch holes in bounds"
+        // clip trick used in draw(_:) miscounts where two holes overlap
+        // (that region's winding parity flips back to "inside", so lines
+        // reappear right along the seam between two overlapping photos —
+        // merging first guarantees every hole is disjoint before clipping.
+        self.photoExclusionRects = Self.mergedRects(photoExclusionRects)
 
         var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0
         paper.getRed(&r, green: &g, blue: &b, alpha: nil)
         let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        isDarkPaper = lum <= 0.45
         lineColor = lum > 0.45
             ? UIColor(red: 0.0, green: 0.47, blue: 0.84, alpha: 0.4)
             : UIColor(white: 0.85, alpha: 0.4)
@@ -1088,12 +1376,49 @@ final class GridContentView: UIView {
         setNeedsDisplay()
     }
 
+    /// Repeatedly unions any pair of intersecting rects until none remain —
+    /// small N (a handful of photos per page at most), so the O(n²) scan is fine.
+    private static func mergedRects(_ rects: [CGRect]) -> [CGRect] {
+        var result = rects
+        var didMerge = true
+        while didMerge {
+            didMerge = false
+            outer: for i in 0..<result.count {
+                for j in (i + 1)..<result.count {
+                    if result[i].intersects(result[j]) {
+                        let union = result[i].union(result[j])
+                        result.remove(at: j)
+                        result.remove(at: i)
+                        result.append(union)
+                        didMerge = true
+                        break outer
+                    }
+                }
+            }
+        }
+        return result
+    }
+
     override func draw(_ rect: CGRect) {
         guard bounds.width > 0, let ctx = UIGraphicsGetCurrentContext() else { return }
 
         let spacing = bounds.width / CGFloat(currentColumns)
 
         if currentStyle != .blank, spacing >= 3 {
+            ctx.saveGState()
+            if !photoExclusionRects.isEmpty {
+                let clipPath = CGMutablePath()
+                clipPath.addRect(bounds)
+                for contentRect in photoExclusionRects {
+                    clipPath.addRect(contentRect.offsetBy(dx: 0, dy: -scrollOffset))
+                }
+                // Even-odd fill rule: the outer `bounds` rect combined with
+                // each photo rect leaves a "donut" — clip to it so none of
+                // the pattern below draws inside a photo's bounding box.
+                ctx.addPath(clipPath)
+                ctx.clip(using: .evenOdd)
+            }
+
             ctx.setStrokeColor(lineColor.cgColor)
             ctx.setFillColor(lineColor.cgColor)
             ctx.setLineWidth(0.5)
@@ -1189,6 +1514,46 @@ final class GridContentView: UIView {
                     ctx.addLine(to: CGPoint(x: bounds.width, y: y))
                     y += spacing
                 }
+                ctx.strokePath()
+
+            case .aiPractice:
+                break // no background lines — question text is drawn below instead
+            }
+            ctx.restoreGState()
+        }
+
+        // AI Practice question text (PaperStyle.aiPractice). Drawn as typed,
+        // non-erasable text — never PencilKit ink — with a faint divider at
+        // the end of each question's blank answer space. scrollOffset keeps
+        // it aligned with the page exactly like the grid/checklist lines above.
+        if !practiceQuestions.isEmpty {
+            // Fixed width, matching AIPracticeGenerator's layout math exactly —
+            // must NOT vary with bounds.width, or lines would wrap differently
+            // here than they did when questionYStart/answerYStart were computed
+            // at generation time, misaligning text against the blank answer space.
+            let textX = AIPracticeGenerator.sidePadding
+            let textWidth = AIPracticeGenerator.contentWidth - AIPracticeGenerator.sidePadding * 2
+            let textAttrs: [NSAttributedString.Key: Any] = [
+                .font: AIPracticeGenerator.questionFont,
+                .foregroundColor: isDarkPaper ? UIColor.white : UIColor.black
+            ]
+            let dividerColor = (isDarkPaper ? UIColor.white : UIColor.black).withAlphaComponent(0.2)
+
+            for q in practiceQuestions {
+                let label = AIPracticeGenerator.labelText(number: q.number, question: q.text)
+                let labelY = q.questionYStart - scrollOffset
+                (label as NSString).draw(
+                    with: CGRect(x: textX, y: labelY, width: textWidth, height: 2000),
+                    options: [.usesLineFragmentOrigin, .usesFontLeading],
+                    attributes: textAttrs,
+                    context: nil
+                )
+
+                let dividerY = q.answerYEnd - scrollOffset
+                ctx.setStrokeColor(dividerColor.cgColor)
+                ctx.setLineWidth(0.5)
+                ctx.move(to: CGPoint(x: textX, y: dividerY))
+                ctx.addLine(to: CGPoint(x: bounds.width - textX, y: dividerY))
                 ctx.strokePath()
             }
         }

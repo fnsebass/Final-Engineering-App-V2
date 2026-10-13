@@ -37,6 +37,9 @@ struct ChapterSidebarView: View {
     @Binding var selectedNote: Notepad?
 
     var onHome: () -> Void
+    /// Collapses this entire side panel — same action as the "<"/">" toggle
+    /// in the notepad's own toolbar, just reachable from the panel itself.
+    var onToggleSidebar: () -> Void
     var canUndo: Bool
     var onUndo: () -> Void
     var onRedo: () -> Void
@@ -71,10 +74,34 @@ struct ChapterSidebarView: View {
             footer
         }
         .background(.regularMaterial)
+        .onChange(of: selectedNote) { _, note in
+            note?.lastAccessedDate = .now
+            guard let chapter = note?.chapter,
+                  chapter.folder?.persistentModelID == book?.persistentModelID else { return }
+            chapter.lastAccessedDate = .now
+        }
+    }
+
+    /// The chapter (within this book) whose notes or disclosure row were
+    /// most recently touched — the only one that auto-expands when the
+    /// sidebar for this book is shown. `nil` if no chapter has been
+    /// accessed yet, in which case every chapter starts collapsed.
+    private var mostRecentlyAccessedChapterID: PersistentIdentifier? {
+        book?.orderedChapters
+            .filter { $0.lastAccessedDate != nil }
+            .max { $0.lastAccessedDate! < $1.lastAccessedDate! }?
+            .persistentModelID
     }
 
     private var topBar: some View {
         HStack(spacing: 14) {
+            Button(action: onToggleSidebar) {
+                Text("<")
+                    .font(.system(size: 14, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close sidebar")
+
             Button(action: onHome) {
                 Image(systemName: "house")
                     .font(.system(size: 14, weight: .semibold))
@@ -154,7 +181,8 @@ struct ChapterSidebarView: View {
                             selectedNote: $selectedNote,
                             onCreateNote: { onCreateNote(chapter) },
                             onRename: { onRenameChapter(chapter) },
-                            onDelete: { onDeleteChapter(chapter) }
+                            onDelete: { onDeleteChapter(chapter) },
+                            isMostRecentlyAccessed: chapter.persistentModelID == mostRecentlyAccessedChapterID
                         )
                     }
 
@@ -347,7 +375,17 @@ private struct ChapterSectionRow: View {
     var onRename: () -> Void
     var onDelete: () -> Void
 
-    @State private var isExpanded = true
+    @State private var isExpanded: Bool
+
+    init(chapter: Chapter, selectedNote: Binding<Notepad?>, onCreateNote: @escaping () -> Void,
+         onRename: @escaping () -> Void, onDelete: @escaping () -> Void, isMostRecentlyAccessed: Bool) {
+        self.chapter = chapter
+        self._selectedNote = selectedNote
+        self.onCreateNote = onCreateNote
+        self.onRename = onRename
+        self.onDelete = onDelete
+        self._isExpanded = State(initialValue: isMostRecentlyAccessed)
+    }
 
     private let cardColumns = [GridItem(.adaptive(minimum: 90, maximum: 120), spacing: 10)]
 
@@ -368,7 +406,7 @@ private struct ChapterSectionRow: View {
             .padding(.top, 8)
             .padding(.bottom, 4)
         } label: {
-            HStack {
+            HStack(spacing: 16) {
                 Text(chapter.name)
                     .font(.subheadline.weight(.semibold))
                 Spacer()
@@ -379,17 +417,40 @@ private struct ChapterSectionRow: View {
                         .frame(width: 22, height: 22)
                         .background(Color.accentColor.opacity(0.15), in: RoundedRectangle(cornerRadius: 7))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.borderless)
                 Menu {
                     Button { onRename() } label: { Label("Rename", systemImage: "pencil") }
                     Button(role: .destructive) { onDelete() } label: { Label("Delete Chapter", systemImage: "trash") }
                 } label: {
                     Image(systemName: "ellipsis")
                         .font(.caption.weight(.semibold))
+                        .frame(width: 22, height: 22)
                 }
+                .menuStyle(.borderlessButton)
+                .padding(.trailing, 6)
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+        .onChange(of: isExpanded) { _, expanded in
+            if expanded {
+                chapter.lastAccessedDate = .now
+                openLastAccessedNote()
+            }
+        }
+        .onAppear {
+            if isExpanded { openLastAccessedNote() }
+        }
+    }
+
+    /// Surfaces whichever note in this chapter was last opened, so reopening
+    /// a chapter (by expanding it, or because it's the book's most recently
+    /// accessed one) brings back where you left off instead of an empty grid.
+    private func openLastAccessedNote() {
+        guard let lastNote = chapter.orderedNotes
+            .filter({ $0.lastAccessedDate != nil })
+            .max(by: { $0.lastAccessedDate! < $1.lastAccessedDate! })
+        else { return }
+        selectedNote = lastNote
     }
 }

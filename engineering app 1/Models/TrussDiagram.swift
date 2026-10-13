@@ -27,12 +27,12 @@ nonisolated struct TrussLoad: Codable, Identifiable, Sendable {
 
 @Model
 final class TrussDiagram {
-    var title: String
-    var createdDate: Date
-    var nodesJSON: String
-    var membersJSON: String
-    var loadsJSON: String
-    var carWeight: Double
+    var title: String = "New Truss"
+    var createdDate: Date = Date()
+    var nodesJSON: String = "[]"
+    var membersJSON: String = "[]"
+    var loadsJSON: String = "[]"
+    var carWeight: Double = 50.0
 
     init(title: String = "New Truss") {
         self.title       = title
